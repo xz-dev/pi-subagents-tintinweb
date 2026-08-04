@@ -1,26 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { renderRunningAgentStatus } from "../src/index.js";
+import { prepareInvocationTagLines, renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
-import { type AgentActivity, AgentWidget, buildInvocationTags, fgPreservingNestedStyles, formatSessionTokens, prepareModelNameForDisplay } from "../src/ui/agent-widget.js";
-
-describe("prepareModelNameForDisplay", () => {
-  it("keeps model names on one printable terminal line", () => {
-    expect(prepareModelNameForDisplay("openai\u001b[2J\n/gpt-5.6-sol")).toBe("openai /gpt-5.6-sol");
-  });
-});
-
-describe("buildInvocationTags", () => {
-  it("keeps the effective model with its model-dependent thinking level", () => {
-    expect(buildInvocationTags({
-      modelName: "gpt-5.6 sol",
-      thinking: "max",
-      maxTurns: 60,
-    })).toEqual({
-      modelName: "gpt-5.6 sol",
-      tags: ["thinking: max", "max turns: 60"],
-    });
-  });
-});
+import {
+  type AgentActivity,
+  AgentWidget,
+  buildInvocationTags,
+  describeActivity,
+  fgPreservingNestedStyles,
+  formatSessionTokens,
+} from "../src/ui/agent-widget.js";
 
 describe("formatSessionTokens", () => {
   const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => s };
@@ -58,6 +46,39 @@ describe("formatSessionTokens", () => {
     expect(fgPreservingNestedStyles(ansiTheme, "accent", tokenText)).toBe(
       "\u001b[35m1.2k token (\u001b[33m70%\u001b[39m\u001b[35m)\u001b[39m",
     );
+  });
+});
+
+describe("describeActivity", () => {
+  it("truncates response activity by Unicode code points without splitting an emoji", () => {
+    const activity = describeActivity(new Map(), `${"a".repeat(59)}😀z`);
+
+    expect(activity).toBe(`${"a".repeat(59)}😀…`);
+    expect(activity).not.toContain("[binary content]");
+  });
+});
+
+describe("buildInvocationTags", () => {
+  it("keeps invocation metadata raw until a display boundary", () => {
+    expect(buildInvocationTags({
+      modelName: "Model\u001b[H\nVariant",
+      thinking: "high\u001b[2J\nforged" as any,
+      isolated: true,
+    })).toEqual({
+      modelName: "Model\u001b[H\nVariant",
+      tags: ["thinking: high\u001b[2J\nforged", "isolated"],
+    });
+  });
+});
+
+describe("prepareInvocationTagLines", () => {
+  it("gates raw invocation tags at the custom tool-result display boundary", () => {
+    expect(prepareInvocationTagLines(["thinking: high\u001b[2J\nforged", "isolated"])).toEqual([
+      "[unsafe terminal content escaped]",
+      "thinking: high\\u{1B}[2J",
+      "forged",
+      "isolated",
+    ]);
   });
 });
 
@@ -152,15 +173,20 @@ describe("AgentWidget", () => {
     expect(lines).toContain("openai-codex/gpt-5.6-sol · thinking: xhigh");
   });
 
-  it("keeps the effective model and thinking in a finished row", () => {
-    const record = makeRecord("finished", { isBackground: true });
-    record.status = "completed";
-    record.completedAt = Date.now();
-    const manager = { listAgents: () => [record] };
-    const widget = new AgentWidget(manager as any, new Map([[record.id, makeActivity()]]), () => "background");
+  it("keeps the effective model and thinking in queued and finished rows", () => {
+    const queued = makeRecord("queued", { isBackground: true });
+    queued.status = "queued";
+    expect(renderLines({ listAgents: () => [queued] }, queued.id, () => "background"))
+      .toContain("openai-codex/gpt-5.6-sol · thinking: xhigh");
+
+    const finished = makeRecord("finished", { isBackground: true });
+    finished.status = "completed";
+    finished.completedAt = Date.now();
+    const manager = { listAgents: () => [finished] };
+    const widget = new AgentWidget(manager as any, new Map([[finished.id, makeActivity()]]), () => "background");
     let factory: any;
     widget.setUICtx({ setStatus: () => {}, setWidget: (_key, content) => { factory = content; } });
-    widget.markFinished(record.id);
+    widget.markFinished(finished.id);
     widget.update();
     const lines = factory({ terminal: { columns: 120 }, requestRender: () => {} }, theme).render().join("\n");
     expect(lines).toContain("openai-codex/gpt-5.6-sol · thinking: xhigh");
@@ -171,15 +197,6 @@ describe("AgentWidget", () => {
   it("keeps agents with no isBackground flag in 'background' mode", () => {
     const manager = { listAgents: () => [makeRecord("unflagged", {})] };
     expect(renderLines(manager, "unflagged", () => "background")).toContain("unflagged description");
-  });
-
-  it("shows each queued agent with its effective model and thinking", () => {
-    const queued = makeRecord("queued", { isBackground: true });
-    queued.status = "queued";
-    const manager = { listAgents: () => [queued] };
-    const lines = renderLines(manager, "queued", () => "background");
-    expect(lines).toContain("queued description");
-    expect(lines).toContain("openai-codex/gpt-5.6-sol · thinking: xhigh");
   });
 
   // "off" hides the widget entirely — even a background agent renders nothing.
