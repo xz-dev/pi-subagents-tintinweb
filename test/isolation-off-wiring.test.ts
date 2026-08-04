@@ -35,13 +35,19 @@ function makePi() {
   return { pi, tools, handlers };
 }
 
+const MODEL = { provider: "faux", id: "test-model", name: "Test model" };
+
 function context(cwd: string) {
   return {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,
-    model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    model: MODEL,
+    modelRegistry: {
+      find: vi.fn(() => MODEL),
+      getAll: vi.fn(() => [MODEL]),
+      getAvailable: vi.fn(() => [MODEL]),
+    },
     sessionManager: { getSessionId: vi.fn(() => "session-1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;
