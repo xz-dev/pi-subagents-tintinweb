@@ -104,16 +104,17 @@ describe("Agent tool model display", () => {
     for (const candidate of [onUpdate.mock.calls.at(-1)?.[0], result]) {
       const collapsed = tool.renderResult(candidate, { expanded: false, isPartial: false }, {
         fg: (_color: string, text: string) => text,
-      }).render(120).join("\n");
+      }, { isError: false }).render(120).join("\n");
       const expanded = tool.renderResult(candidate, { expanded: true, isPartial: false }, {
         fg: (_color: string, text: string) => text,
-      }).render(120).join("\n");
+      }, { isError: false }).render(120).join("\n");
       expect(collapsed).toContain("openai-codex/gpt-5.6-sol");
       expect(expanded).toContain("openai-codex/gpt-5.6-sol");
-      expect(collapsed).toContain("thinking: xhigh");
-      expect(expanded).toContain("thinking: xhigh");
+      expect(collapsed).toContain("thinking:");
+      expect(expanded).toContain("thinking:");
       expect(collapsed).not.toContain("Ambiguous Display Name");
     }
+    expect(result.details.tags).toContain("thinking: xhigh");
   });
 
   it("shows the canonical pre-session model in the immediate background result", async () => {
@@ -144,7 +145,7 @@ describe("Agent tool model display", () => {
     for (const expanded of [false, true]) {
       const rendered = tool.renderResult(result, { expanded, isPartial: false }, {
         fg: (_color: string, text: string) => text,
-      }).render(120).join("\n");
+      }, { isError: false }).render(120).join("\n");
       expect(rendered).toContain("openai-codex/gpt-5.6-sol");
       expect(rendered).toContain("thinking:");
       expect(rendered).not.toContain("anthropic/claude-sonnet-4-6");
@@ -192,7 +193,7 @@ describe("Agent tool model display", () => {
     );
     const rendered = tool.renderResult(resumed, { expanded: false, isPartial: false }, {
       fg: (_color: string, text: string) => text,
-    }).render(120).join("\n");
+    }, { isError: false }).render(120).join("\n");
     expect(rendered).toContain("anthropic/claude-sonnet-4-6");
     expect(rendered).toContain("thinking: medium");
     expect(rendered).not.toContain("google/gemini-3-pro");

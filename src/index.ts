@@ -1206,6 +1206,10 @@ Terse command-style prompts produce shallow, generic work.
       const customConfig = getAgentConfig(subagentType);
 
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, params);
+      if (resolvedConfig.modelFromParams && resolvedConfig.modelInput) {
+        const explicitModel = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
+        if (typeof explicitModel === "string") rejectInvocation(explicitModel);
+      }
 
       // Preserve the existing config-only invocation seam when the parent has
       // no model (notably headless/tests); runAgent still resolves that config.
@@ -1235,6 +1239,9 @@ Terse command-style prompts produce shallow, generic work.
           status: "unavailable",
           error: candidate.error,
         })));
+        if (resolvedConfig.modelFromParams) {
+          rejectInvocation(candidateResolution?.candidates[0]?.error ?? diagnostics);
+        }
         return textResult(fallbackNote ? `${fallbackNote}${diagnostics}` : diagnostics);
       }
 
