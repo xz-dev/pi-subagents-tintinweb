@@ -9,7 +9,7 @@ import { stripVTControlCharacters } from "node:util";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
-import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
+import type { AgentInvocation, AgentOutcome, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
 
 // ---- Constants ----
@@ -93,6 +93,7 @@ export interface AgentDetails {
   maxTurns?: number;
   agentId?: string;
   error?: string;
+  outcome?: AgentOutcome;
 }
 
 // ---- Formatting helpers ----
