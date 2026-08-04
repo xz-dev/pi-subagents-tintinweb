@@ -82,6 +82,19 @@ describe("settings persistence", () => {
     });
   });
 
+  it("sanitizes defaultFallbackModels and lets the project replace the global list", () => {
+    writeGlobal({ defaultFallbackModels: ["anthropic/a", " openai/b ", "anthropic/a"] });
+    writeProject({ defaultFallbackModels: ["google/c"] });
+    expect(loadSettings(projectDir).defaultFallbackModels).toEqual(["google/c"]);
+  });
+
+  it("drops invalid defaultFallbackModels values", () => {
+    for (const value of ["openai/gpt-4o", [], ["openai/gpt-4o", 1], ["  "]]) {
+      writeGlobal({ defaultFallbackModels: value });
+      expect(loadSettings(projectDir).defaultFallbackModels).toBeUndefined();
+    }
+  });
+
   it("round-trips values: saveSettings then loadSettings", () => {
     const settings = {
       maxConcurrent: 7,
@@ -433,6 +446,12 @@ describe("settings persistence", () => {
       expect(appliers.setScopeModels).not.toHaveBeenCalled();
       expect(appliers.setDisableDefaultAgents).not.toHaveBeenCalled();
       expect(appliers.setToolDescriptionMode).not.toHaveBeenCalled();
+    });
+
+    it("keeps defaultFallbackModels in the loaded settings without an applier", () => {
+      const settings = { defaultFallbackModels: ["openai/gpt-4o"] };
+      applySettings(settings, appliers);
+      expect(settings.defaultFallbackModels).toEqual(["openai/gpt-4o"]);
     });
 
     it("applies fallbackSubagent through to the registry", () => {

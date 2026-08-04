@@ -13,6 +13,7 @@ let manager: NestedAgentManager;
 let records: Map<string, any>;
 let spawn: ReturnType<typeof vi.fn>;
 let spawnAndWait: ReturnType<typeof vi.fn>;
+let originalAgentDir: string | undefined;
 
 function writeAgent(name: string, extra = "") {
   const dir = join(cwd, ".pi", "agents");
@@ -28,7 +29,7 @@ const MODELS = [
 function ctx(executionCwd = cwd) {
   return {
     cwd: executionCwd,
-    model: undefined,
+    model: MODELS[0],
     modelRegistry: {
       find: (provider: string, id: string) => ({ provider, id }),
       getAvailable: () => MODELS,
@@ -60,6 +61,8 @@ async function execute(tool: any, params: Record<string, unknown>, executionCwd 
 
 beforeEach(() => {
   cwd = mkdtempSync(join(tmpdir(), "nested-tools-test-"));
+  originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(cwd, ".pi", "agent");
   writeAgent("scout");
   writeAgent("reviewer");
   registerAgents(loadCustomAgents(cwd));
@@ -85,6 +88,8 @@ beforeEach(() => {
 
 afterEach(() => {
   setScopeModelsEnabled(false);
+  if (originalAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   rmSync(cwd, { recursive: true, force: true });
 });
 

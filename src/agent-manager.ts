@@ -14,7 +14,8 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildAgentOutcome, sanitizeAgentCause } from "./agent-outcome.js";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
-import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
+import { resolveResumeModelCandidates } from "./model-fallback.js";
+import type { AgentInvocation, AgentRecord, IsolationMode, ModelCandidate, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, pruneWorktrees, tryCreateWorktree, type WorktreeCreateFailureReason } from "./worktree.js";
 
@@ -113,6 +114,8 @@ interface SpawnArgs {
 interface SpawnOptions {
   description: string;
   model?: Model<any>;
+  modelCandidates?: ModelCandidate[];
+  callerSuppliedModel?: boolean;
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -240,6 +243,8 @@ export class AgentManager {
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
       invocation: options.invocation,
+      modelCandidates: options.modelCandidates,
+      callerSuppliedModel: options.callerSuppliedModel,
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
       maxSubagentDepth: options.maxSubagentDepth,
@@ -323,6 +328,7 @@ export class AgentManager {
       pi,
       agentId: id,
       model: options.model,
+      callerSuppliedModel: options.callerSuppliedModel,
       maxTurns: options.maxTurns,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
@@ -350,6 +356,8 @@ export class AgentManager {
         this.onCompact?.(record, info);
         options.onCompaction?.(info);
       },
+      modelCandidates: options.modelCandidates,
+      onBeforeModelFallback: () => this.abortOwnedChildren(id),
       nestedRuntime: {
         manager: this,
         parentAgentId: id,
@@ -374,7 +382,7 @@ export class AgentManager {
         options.onSessionCreated?.(session);
       },
     })
-      .then(({ responseText, session, aborted, steered, failure }) => {
+      .then(({ responseText, session, aborted, steered, failure, modelAttempts }) => {
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
@@ -391,6 +399,9 @@ export class AgentManager {
         }
         record.result = responseText;
         record.session = session;
+        record.modelAttempts = modelAttempts;
+        const effectiveModel = session.model;
+        if (effectiveModel && record.invocation) record.invocation.modelName = effectiveModel.id;
         record.completedAt ??= Date.now();
         record.outcome = buildAgentOutcome(record, "run");
 
@@ -589,7 +600,12 @@ export class AgentManager {
     record.outcome = undefined;
 
     try {
-      const { text, failure, aborted } = await resumeAgent(record.session, prompt, {
+      const currentModel = record.session.model;
+      const configuredInputs = record.modelCandidates?.map(candidate => candidate.input) ?? [];
+      const resumeCandidates = currentModel
+        ? resolveResumeModelCandidates(currentModel, configuredInputs, record.session.modelRegistry).candidates
+        : record.modelCandidates ?? [];
+      const { text, failure, aborted, modelAttempts } = await resumeAgent(record.session, prompt, {
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
         },
@@ -601,6 +617,10 @@ export class AgentManager {
           this.onCompact?.(record, info);
         },
         signal,
+        modelCandidates: record.callerSuppliedModel
+          ? currentModel ? [{ input: `${currentModel.provider}/${currentModel.id}`, model: currentModel }] : []
+          : resumeCandidates,
+        onBeforeModelFallback: () => this.abortOwnedChildren(id),
       });
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available. A
@@ -610,6 +630,12 @@ export class AgentManager {
       if (failure) record.error = sanitizeAgentCause(failure);
       if (aborted) record.stopOrigin = "caller";
       record.result = text;
+      record.modelAttempts = modelAttempts;
+      const effectiveModel = record.session.model;
+      if (record.invocation) {
+        record.invocation.modelName = effectiveModel ? `${effectiveModel.provider}/${effectiveModel.id}` : undefined;
+        record.invocation.thinking = record.session.thinkingLevel;
+      }
       record.completedAt = Date.now();
       record.outcome = buildAgentOutcome(
         record,

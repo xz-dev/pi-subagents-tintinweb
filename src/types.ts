@@ -2,7 +2,7 @@
  * types.ts — Type definitions for the subagent system.
  */
 
-import type { ThinkingLevel } from "@earendil-works/pi-ai";
+import type { Model, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { LifetimeUsage } from "./usage.js";
 
@@ -39,6 +39,8 @@ export interface AgentConfig {
   /** true = inherit all, string[] = only listed, false = none */
   skills: true | string[] | false;
   model?: string;
+  /** Ordered model fallbacks. false explicitly disables inherited defaults. */
+  fallbackModels?: string[] | false;
   thinking?: ThinkingLevel;
   maxTurns?: number;
   /** Persist this subagent as a normal pi session instead of keeping it in memory only. */
@@ -111,6 +113,18 @@ export interface AgentOutcome {
  */
 export type WidgetMode = 'all' | 'background' | 'off';
 
+export interface ModelCandidate {
+  input: string;
+  model?: Model<any>;
+  error?: string;
+}
+
+export interface ModelAttempt {
+  model: string;
+  status: "unavailable" | "failed" | "succeeded";
+  error?: string;
+}
+
 export interface AgentRecord {
   id: string;
   type: SubagentType;
@@ -152,6 +166,12 @@ export interface AgentRecord {
   lifetimeUsage: LifetimeUsage;
   /** Number of times this agent's session has compacted. Initialized to 0 at spawn. */
   compactionCount: number;
+  /** Ordered model attempts across this agent's latest invocation cycle. */
+  modelAttempts?: ModelAttempt[];
+  /** Resolved model chain from the original spawn. */
+  modelCandidates?: ModelCandidate[];
+  /** Whether the effective primary came from Agent({ model }). */
+  callerSuppliedModel?: boolean;
   /**
    * Whether this agent was spawned to run in the background. Tri-state, set at
    * spawn from `SpawnOptions.isBackground`: `true` = background, `false` =

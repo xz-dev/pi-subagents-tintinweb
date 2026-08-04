@@ -10,6 +10,8 @@ import type { JoinMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
   maxConcurrent?: number;
+  /** Ordered fallback models inherited by agents that omit fallback_models. */
+  defaultFallbackModels?: string[];
   /**
    * 0 = unlimited — the extension's single source of truth for that convention:
    * `normalizeMaxTurns()` in agent-runner.ts treats 0 → `undefined`, and the
@@ -158,6 +160,12 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (!raw || typeof raw !== "object") return {};
   const r = raw as Record<string, unknown>;
   const out: SubagentsSettings = {};
+  if (Array.isArray(r.defaultFallbackModels) && r.defaultFallbackModels.length > 0) {
+    const values = r.defaultFallbackModels;
+    if (values.every((value): value is string => typeof value === "string" && value.trim().length > 0)) {
+      out.defaultFallbackModels = [...new Set(values.map(value => value.trim()))];
+    }
+  }
   if (
     Number.isInteger(r.maxConcurrent) &&
     (r.maxConcurrent as number) >= 1 &&

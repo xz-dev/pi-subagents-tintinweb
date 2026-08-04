@@ -666,6 +666,55 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
     expect(manager.getRecord(id)!.compactionCount).toBe(2);
   });
 
+  it("resume orders candidates as current, original primary, then remaining fallbacks", async () => {
+    const primary = { provider: "anthropic", id: "primary" } as any;
+    const current = { provider: "openai", id: "backup" } as any;
+    const last = { provider: "google", id: "last" } as any;
+    const session = {
+      model: current,
+      modelRegistry: {
+        find: (provider: string, id: string) => [primary, current, last]
+          .find(model => model.provider === provider && model.id === id),
+        getAll: () => [primary, current, last],
+        getAvailable: () => [primary, current, last],
+      },
+      dispose: vi.fn(),
+    } as any;
+    resolvedRun().mockResolvedValueOnce({
+      responseText: "spawned",
+      session,
+      aborted: false,
+      steered: false,
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "Explore", "go", {
+      description: "test",
+      isBackground: false,
+      model: primary,
+      modelCandidates: [
+        { input: "anthropic/primary", model: primary },
+        { input: "openai/backup", model: current },
+        { input: "google/last", model: last },
+      ],
+    } as any);
+    await manager.getRecord(id)!.promise;
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "resumed" });
+
+    await manager.resume(id, "continue");
+
+    expect(vi.mocked(resumeAgent)).toHaveBeenCalledWith(
+      session,
+      "continue",
+      expect.objectContaining({
+        modelCandidates: [
+          { input: "openai/backup", model: current },
+          { input: "anthropic/primary", model: primary },
+          { input: "google/last", model: last },
+        ],
+      }),
+    );
+  });
+
   it("resume() also accumulates usage and increments compactions on the same record", async () => {
     manager = new AgentManager();
 

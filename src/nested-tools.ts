@@ -18,7 +18,7 @@ import {
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { resolveAgentInvocationConfig } from "./invocation-config.js";
-import { resolveModel } from "./model-resolver.js";
+import { formatModelAttempts, resolveModelCandidates } from "./model-fallback.js";
 import { checkModelScope } from "./model-scope.js";
 import {
   createOutputFilePath,
@@ -26,12 +26,14 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
+import { loadSettings } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import type {
   AgentConfig,
   AgentInvocation,
   AgentRecord,
   IsolationMode,
+  ModelCandidate,
   ThinkingLevel,
 } from "./types.js";
 import { addUsage } from "./usage.js";
@@ -52,6 +54,8 @@ const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as 
 interface NestedSpawnOptions {
   description: string;
   model?: Model<any>;
+  modelCandidates?: ModelCandidate[];
+  callerSuppliedModel?: boolean;
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -232,14 +236,21 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
 
       const config = getAgentConfigIn(registry, resolvedType);
       const invocation = resolveAgentInvocationConfig(config, params);
-      let model = ctx.model;
-      if (invocation.modelInput) {
-        const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
-        if (typeof resolvedModel === "string") {
-          if (invocation.modelFromParams) return textResult(resolvedModel, true);
-        } else {
-          model = resolvedModel;
-        }
+      const candidateResolution = resolveModelCandidates({
+        primary: invocation.modelInput ? undefined : ctx.model,
+        primaryInput: invocation.modelInput,
+        callerSupplied: invocation.modelFromParams,
+        fallbackModels: invocation.fallbackModels,
+        defaultFallbackModels: loadSettings(context.configCwd).defaultFallbackModels,
+        registry: ctx.modelRegistry,
+      });
+      const model = candidateResolution.models[0];
+      if (!model) {
+        return textResult(formatModelAttempts(candidateResolution.candidates.map(candidate => ({
+          model: candidate.input,
+          status: "unavailable",
+          error: candidate.error,
+        }))), true);
       }
 
       // Same scopeModels policy as the top-level Agent tool — a nested spawn
@@ -262,6 +273,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const options: NestedSpawnOptions = {
         description: params.description,
         model,
+        modelCandidates: candidateResolution.candidates,
+        callerSuppliedModel: invocation.modelFromParams,
         maxTurns: invocation.maxTurns,
         isolated: invocation.isolated,
         inheritContext: invocation.inheritContext,

@@ -218,7 +218,8 @@ All fields are optional — sensible defaults for everything.
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
 | `isolation` | — | Set to `worktree` to run in an isolated git worktree |
-| `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
+| `model` | inherit parent | Primary model — `provider/modelId` or an unambiguous fuzzy name (`"haiku"`, `"sonnet"`). Provider-qualified names stay within that provider; bare names must have one best match across providers. |
+| `fallback_models` | `subagents.json` `defaultFallbackModels` | Ordered comma-separated or YAML-list backup models. A list replaces the global/project default; `false` explicitly disables inherited defaults. No camelCase frontmatter alias or other disable spelling is accepted. |
 | `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
 | `persist_session` | `false` | Persist this subagent as a normal pi session instead of keeping the session in memory only. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
@@ -397,6 +398,36 @@ When background agents complete, they notify the main agent. The **join mode** c
 **Configuration:**
 - Configure join mode in `/agents` → Settings → Join mode
 
+## Fallback Models
+
+`fallback_models` is a model chain, independent of `fallbackSubagent` (which substitutes an **agent type** when `subagent_type` does not resolve):
+
+```yaml
+---
+model: anthropic/claude-haiku-4-5
+fallback_models:
+  - openai/gpt-4o-mini
+  - google/gemini-2.5-flash
+---
+```
+
+Set defaults globally in `~/.pi/agent/subagents.json` or per project in `<cwd>/.pi/subagents.json`; project settings replace the global field:
+
+```json
+{
+  "defaultFallbackModels": [
+    "openai/gpt-4o-mini",
+    "google/gemini-2.5-flash"
+  ]
+}
+```
+
+Precedence is `fallback_models: false` (disable) → agent list (replace) → `defaultFallbackModels` (inherit). An explicit `Agent({ model: "..." })` suppresses cross-model fallback, but Pi's normal same-model automatic retries still run. Otherwise Pi exhausts same-model retries first, then advances on a final provider/model assistant error. Context overflow stays with Pi compaction; tool errors, aborts, stops, max-turn outcomes, and ordinary task failure never advance the chain.
+
+Fallback stays in one child session: the failed branch remains in its append-only session/transcript for diagnosis, while the active context returns to the invocation prompt before switching model. Only the successful model's final answer is returned. All candidates unavailable/failed produces a bounded `Model attempts` error and never silently inherits an unlisted model. Retrying a whole invocation may repeat tool side effects; active nested children from the failed attempt are stopped before the next model begins.
+
+Automatic switching uses a private in-memory clone of Pi settings, so it does not change Pi's global/project default model. Requires Pi 0.80.5 or later.
+
 ## Model Scope
 
 **Opt-in:** off by default. Enable via `/agents → Settings → Scope models`.
@@ -408,7 +439,7 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 | Model source | Out-of-scope behavior |
 |---|---|
 | Caller-supplied via `Agent({ model: "..." })` | Hard error returned to the orchestrator, listing allowed models |
-| Pinned in agent frontmatter | Warning toast + the pinned model runs (frontmatter is authoritative) |
+| Pinned in agent frontmatter or fallback chain | Warning toast + the configured model runs (frontmatter/settings are authoritative) |
 | Parent-inherited (neither set) | Warning toast + parent's model runs |
 
 **Design:** `scopeModels` is a guardrail against the orchestrator picking unexpected models at runtime, not a hard policy against user-level config. The "frontmatter is authoritative" guarantee from v0.5.1 still holds for `model:` — caller params can't override frontmatter, and frontmatter pins run even when out of scope (with a visible warning).

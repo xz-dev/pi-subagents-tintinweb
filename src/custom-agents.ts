@@ -68,6 +68,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       excludeExtensions: csvListOptional(fm.exclude_extensions),
       skills: inheritField(fm.skills ?? fm.inherit_skills),
       model: str(fm.model),
+      fallbackModels: parseFallbackModels(fm.fallback_models),
       thinking: str(fm.thinking) as ThinkingLevel | undefined,
       maxTurns: nonNegativeInt(fm.max_turns),
       persistSession: fm.persist_session != null ? fm.persist_session === true : undefined,
@@ -161,6 +162,19 @@ function parseToolsField(val: unknown): { builtinToolNames: string[]; extSelecto
  */
 function csvListOptional(val: unknown): string[] | undefined {
   return parseCsvField(val);
+}
+
+function parseFallbackModels(val: unknown): string[] | false | undefined {
+  if (val === false) return false;
+  if (Array.isArray(val)) {
+    const items = val.filter((item): item is string => typeof item === "string")
+      .map(item => item.trim())
+      .filter(Boolean);
+    return items.length === val.length && items.length > 0 ? [...new Set(items)] : undefined;
+  }
+  if (typeof val !== "string") return undefined;
+  const items = val.split(",").map(item => item.trim()).filter(Boolean);
+  return items.length > 0 ? [...new Set(items)] : undefined;
 }
 
 /**
