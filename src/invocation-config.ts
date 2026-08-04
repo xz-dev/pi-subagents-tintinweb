@@ -1,4 +1,10 @@
-import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
+import type {
+  AgentConfig,
+  IsolationMode,
+  IsolationPreference,
+  JoinMode,
+  ThinkingLevel,
+} from "./types.js";
 
 interface AgentInvocationParams {
   model?: string;
@@ -7,7 +13,7 @@ interface AgentInvocationParams {
   run_in_background?: boolean;
   inherit_context?: boolean;
   isolated?: boolean;
-  isolation?: IsolationMode;
+  isolation?: IsolationPreference;
 }
 
 export function resolveAgentInvocationConfig(
@@ -34,7 +40,9 @@ export function resolveAgentInvocationConfig(
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,
-    isolation: agentConfig?.isolation ?? params.isolation,
+    isolation: (params.isolation ?? agentConfig?.isolation) === "worktree"
+      ? "worktree"
+      : undefined,
   };
 }
 

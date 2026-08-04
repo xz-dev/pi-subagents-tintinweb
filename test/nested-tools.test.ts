@@ -105,7 +105,7 @@ describe("child-safe nested Agent tools", () => {
     });
     expect((agent.parameters as any).properties.isolation).toMatchObject({
       type: "string",
-      enum: ["worktree"],
+      enum: ["worktree", "off"],
     });
   });
 

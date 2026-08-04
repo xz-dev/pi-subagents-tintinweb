@@ -34,7 +34,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentRecord, type IsolationMode, type JoinMode, type NotificationDetails, type SubagentType, type ThinkingLevel, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentRecord, type IsolationMode, type IsolationPreference, type JoinMode, type NotificationDetails, type SubagentType, type ThinkingLevel, type WidgetMode } from "./types.js";
 import {
   type AgentActivity,
   type AgentDetails,
@@ -806,7 +806,7 @@ Notes:
 - Parallel work: one message, multiple Agent calls, run_in_background: true on each. Background completion is delivered automatically — never poll or sleep.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues the exact prior session using only prompt + resume; steer_subagent messages a running one.
-- isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.`;
+- isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch. isolation: "off" explicitly disables worktree isolation, including a custom agent's worktree default.`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -836,7 +836,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use a nonblank model to override the selected agent's frontmatter model (as "provider/modelId", or an unambiguous fuzzy name). Blank means omitted.
 - Agent frontmatter takes precedence for thinking, max_turns, run_in_background, inherit_context, and isolated; call values fill only fields frontmatter leaves unspecified.
 - With resume, only prompt and resume are used. Omit spawn-only fields; use steer_subagent to redirect a running agent.
-- Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications). The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.${scheduleGuideline}
+- Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications), or isolation: "off" to explicitly disable worktree isolation even when the chosen agent defaults to it. The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.${scheduleGuideline}
 
 ## Writing the prompt
 
@@ -936,8 +936,8 @@ Terse command-style prompts produce shallow, generic work.
       inherit_context: Type.Optional(Type.Boolean({
         description: "Fork parent context when agent frontmatter does not define inheritance. Default false; ignored on resume.",
       })),
-      isolation: Type.Optional(Type.Unsafe<IsolationMode>(StringEnum(["worktree"] as const, {
-        description: 'Run a new agent in a temporary Git worktree; ignored on resume.',
+      isolation: Type.Optional(Type.Unsafe<IsolationPreference>(StringEnum(["worktree", "off"] as const, {
+        description: 'Use "worktree" for a temporary Git worktree, or "off" to explicitly disable worktree isolation (including an agent default); ignored on resume.',
       }))),
       ...scheduleParam,
     }, { additionalProperties: false }),
@@ -1091,7 +1091,7 @@ Terse command-style prompts produce shallow, generic work.
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, {
         ...params,
         thinking: params.thinking as string | undefined,
-        isolation: params.isolation as IsolationMode | undefined,
+        isolation: params.isolation as IsolationPreference | undefined,
       });
 
       // Preserve the existing config-only invocation seam when the parent has
