@@ -11,7 +11,7 @@ import { extractText } from "../context.js";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
-import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatDuration, formatSessionTokens, getDisplayName, getPromptModeLabel } from "./agent-widget.js";
+import { type AgentActivity, activityDurationMs, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatActivityWithElapsed, formatDuration, formatSessionTokens, getDisplayName, getPromptModeLabel } from "./agent-widget.js";
 import { prepareConversationDisplay } from "./prepare-conversation-display.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
@@ -382,9 +382,11 @@ export class ConversationViewer implements Component {
 
     // Streaming indicator for running agents
     if (this.record.status === "running" && this.activity) {
+      const activity = describeActivity(this.activity.activeTools, this.activity.responseText);
+      const withElapsed = formatActivityWithElapsed(activity, activityDurationMs(this.activity, activity));
       lines.push("");
-      appendPrepared(describeActivity(this.activity.activeTools, this.activity.responseText), {
-        frame: (line) => th.fg("accent", "▍ ") + th.fg("dim", line),
+      appendPrepared(withElapsed, {
+        frame: (line) => th.fg("accent", "▍ ") + fgPreservingNestedStyles(th, "dim", line),
       });
     }
 
