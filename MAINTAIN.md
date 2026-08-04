@@ -39,6 +39,7 @@ The enabled patch order at the time this file was introduced is:
 10. `origin/fix/agent-tool-error-rendering` — upstream PR #195
 11. `origin/test/oauth-session-regression` — upstream PR #198
 12. `origin/feat/fallback-models` — downstream-only fallback model chains (no upstream PR)
+13. `origin/fix/explicit-isolation-off` — downstream explicit `Agent` isolation opt-out, independently implemented with upstream PR #201 as prior art
 
 When integrating PR #154 immediately after PR #168, resolve their overlapping
 `buildInvocationTags()` hunk by preserving PR #154's raw-metadata contract:
