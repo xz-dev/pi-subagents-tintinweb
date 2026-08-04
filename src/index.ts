@@ -25,6 +25,7 @@ import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
+import { formatModelAttempts, resolveModelCandidates } from "./model-fallback.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
@@ -748,7 +749,7 @@ export default function (pi: ExtensionAPI) {
   // Apply persisted settings on startup and emit `subagents:settings_loaded`.
   // Global + project merged; missing → defaults; corrupt file emits a warning
   // to stderr and falls back to defaults.
-  applyAndEmitLoaded(
+  const loadedSettings = applyAndEmitLoaded(
     {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
       setDefaultMaxTurns,
@@ -1093,16 +1094,41 @@ Terse command-style prompts produce shallow, generic work.
         isolation: params.isolation as IsolationMode | undefined,
       });
 
-      // Resolve model from agent config first; tool-call params only fill gaps.
-      let model = ctx.model;
-      if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (resolvedConfig.modelFromParams || params.schedule) throw new Error(resolved);
-          // Configured immediate spawns preserve the existing parent fallback.
-        } else {
-          model = resolved;
+      // Preserve the existing config-only invocation seam when the parent has
+      // no model (notably headless/tests); runAgent still resolves that config.
+      // Candidate pre-resolution is needed when a parent model exists or a
+      // fallback chain is actually configured.
+      const shouldResolveCandidates = ctx.model !== undefined ||
+        resolvedConfig.fallbackModels !== undefined ||
+        (loadedSettings.defaultFallbackModels?.length ?? 0) > 0 ||
+        resolvedConfig.modelFromParams || params.schedule !== undefined;
+      const candidateResolution = shouldResolveCandidates
+        ? resolveModelCandidates({
+            primary: resolvedConfig.modelInput ? undefined : ctx.model,
+            primaryInput: resolvedConfig.modelInput,
+            callerSupplied: resolvedConfig.modelFromParams,
+            fallbackModels: resolvedConfig.fallbackModels,
+            defaultFallbackModels: loadedSettings.defaultFallbackModels,
+            registry: ctx.modelRegistry,
+          })
+        : undefined;
+      const model = shouldResolveCandidates
+        ? candidateResolution?.models[0]
+        : ctx.model;
+      const hasConfiguredModelChain = resolvedConfig.modelInput !== undefined ||
+        resolvedConfig.fallbackModels !== undefined ||
+        (loadedSettings.defaultFallbackModels?.length ?? 0) > 0;
+      if (shouldResolveCandidates && !model && hasConfiguredModelChain) {
+        const candidates = candidateResolution?.candidates ?? [];
+        if (resolvedConfig.modelFromParams && candidates.length === 1 && candidates[0]?.error) {
+          throw new Error(candidates[0].error);
         }
+        const diagnostics = formatModelAttempts(candidates.map(candidate => ({
+          model: candidate.input,
+          status: "unavailable",
+          error: candidate.error,
+        })));
+        throw new Error(fallbackNote ? `${fallbackNote}${diagnostics}` : diagnostics);
       }
 
       // Scope validation: the effective resolved model is checked against the
@@ -1191,7 +1217,7 @@ Terse command-style prompts produce shallow, generic work.
             // at fire time, and the original is what a user edits.
             subagent_type: requestedType,
             prompt: params.prompt as string,
-            model: resolvedConfig.modelInput,
+            model: candidateResolution?.candidates[0]?.input ?? resolvedConfig.modelInput,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
             isolated: isolated,
@@ -1229,6 +1255,8 @@ Terse command-style prompts produce shallow, generic work.
           id = manager.spawn(pi, ctx, subagentType, params.prompt, {
             description: params.description,
             model,
+            modelCandidates: candidateResolution?.candidates,
+            callerSuppliedModel: resolvedConfig.modelFromParams,
             maxTurns: effectiveMaxTurns,
             isolated,
             inheritContext,
@@ -1356,6 +1384,8 @@ Terse command-style prompts produce shallow, generic work.
         const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
           description: params.description,
           model,
+          modelCandidates: candidateResolution?.candidates,
+          callerSuppliedModel: resolvedConfig.modelFromParams,
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,

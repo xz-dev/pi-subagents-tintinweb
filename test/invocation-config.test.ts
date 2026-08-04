@@ -43,6 +43,7 @@ describe("resolveAgentInvocationConfig", () => {
 
     expect(resolved.modelInput).toBe("provider/param-model");
     expect(resolved.modelFromParams).toBe(true);
+    expect(resolved.fallbackModels).toBeUndefined();
     expect(resolved.thinking).toBe("high");
     expect(resolved.maxTurns).toBe(42);
     expect(resolved.inheritContext).toBe(false);
@@ -63,6 +64,13 @@ describe("resolveAgentInvocationConfig", () => {
       expect(resolved.modelFromParams).toBe(false);
     },
   );
+
+  it("resolves per-agent fallback precedence without exposing a per-call override", () => {
+    expect(resolveAgentInvocationConfig(makeConfig({ fallbackModels: ["provider/a"] }), {}))
+      .toMatchObject({ fallbackModels: ["provider/a"] });
+    expect(resolveAgentInvocationConfig(makeConfig({ fallbackModels: false }), {}))
+      .toMatchObject({ fallbackModels: false });
+  });
 
   it("uses tool-call params when no agent config is available", () => {
     const resolved = resolveAgentInvocationConfig(undefined, {

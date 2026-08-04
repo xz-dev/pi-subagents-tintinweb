@@ -104,6 +104,7 @@ Workspace prompt.`);
 description: Security Auditor
 tools: read, grep, find
 model: anthropic/claude-opus-4-6
+fallback_models: openai/gpt-4o, google/gemini-2.5-flash
 thinking: high
 max_turns: 30
 persist_session: true
@@ -126,6 +127,7 @@ You are a security auditor.`);
     expect(agent.description).toBe("Security Auditor");
     expect(agent.builtinToolNames).toEqual(["read", "grep", "find"]);
     expect(agent.model).toBe("anthropic/claude-opus-4-6");
+    expect(agent.fallbackModels).toEqual(["openai/gpt-4o", "google/gemini-2.5-flash"]);
     expect(agent.thinking).toBe("high");
     expect(agent.maxTurns).toBe(30);
     expect(agent.persistSession).toBe(true);
@@ -137,6 +139,32 @@ You are a security auditor.`);
     expect(agent.runInBackground).toBe(true);
     expect(agent.isolated).toBe(true);
     expect(agent.systemPrompt).toBe("You are a security auditor.");
+  });
+
+  it("accepts only false as an explicit fallback disable", () => {
+    writeAgent("disabled", `---
+description: Disabled fallback
+fallback_models: false
+---
+
+Prompt.`);
+    writeAgent("empty", `---
+description: Empty fallback
+fallback_models:
+---
+
+Prompt.`);
+    writeAgent("alias", `---
+description: Unsupported alias
+fallbackModels: openai/gpt-4o
+---
+
+Prompt.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("disabled")?.fallbackModels).toBe(false);
+    expect(result.get("empty")?.fallbackModels).toBeUndefined();
+    expect(result.get("alias")?.fallbackModels).toBeUndefined();
   });
 
   it("uses sensible defaults when frontmatter is empty", () => {

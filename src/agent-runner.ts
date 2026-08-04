@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import type { Model } from "@earendil-works/pi-ai";
+import { isContextOverflow, type Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
@@ -23,10 +23,12 @@ import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import { formatModelAttempts, resolveModelCandidates } from "./model-fallback.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+import { loadSettings } from "./settings.js";
 import { preloadSkills } from "./skill-loader.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { ModelAttempt, ModelCandidate, SubagentType, ThinkingLevel } from "./types.js";
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
@@ -324,33 +326,6 @@ export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
  * Try to find the right model for an agent type.
  * Priority: explicit option > config.model > parent model.
  */
-function resolveDefaultModel(
-  parentModel: Model<any> | undefined,
-  registry: { find(provider: string, modelId: string): Model<any> | undefined; getAvailable?(): Model<any>[] },
-  configModel?: string,
-): Model<any> | undefined {
-  if (configModel) {
-    const slashIdx = configModel.indexOf("/");
-    if (slashIdx !== -1) {
-      const provider = configModel.slice(0, slashIdx);
-      const modelId = configModel.slice(slashIdx + 1);
-
-      // Build a set of available model keys for fast lookup
-      const available = registry.getAvailable?.();
-      const availableKeys = available
-        ? new Set(available.map((m: any) => `${m.provider}/${m.id}`))
-        : undefined;
-      const isAvailable = (p: string, id: string) =>
-        !availableKeys || availableKeys.has(`${p}/${id}`);
-
-      const found = registry.find(provider, modelId);
-      if (found && isAvailable(provider, modelId)) return found;
-    }
-  }
-
-  return parentModel;
-}
-
 /** Info about a tool event in the subagent. */
 export interface ToolActivity {
   type: "start" | "end";
@@ -402,6 +377,12 @@ export interface RunOptions {
    * pre-compaction context size estimate. Aborted compactions don't fire.
    */
   onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
+  /** Ordered runnable candidates for this invocation cycle. */
+  modelCandidates?: ModelCandidate[];
+  /** True when options.model came from an explicit Agent({ model }) call. */
+  callerSuppliedModel?: boolean;
+  /** Stop nested children owned by the current failed attempt before fallback. */
+  onBeforeModelFallback?: () => void;
   /** Runtime bridge for opt-in child-safe nested delegation. */
   nestedRuntime?: {
     manager: NestedAgentManager;
@@ -428,6 +409,7 @@ export interface RunResult {
    * stop that produced text (a legitimate truncated answer).
    */
   failure?: string;
+  modelAttempts?: ModelAttempt[];
 }
 
 /**
@@ -481,6 +463,14 @@ function getLastAssistantText(session: AgentSession, startIndex = 0): string {
  * Bounded by `startIndex` (like the text fallback) so a resume that produced no
  * assistant message of its own never inherits a PRIOR turn's stop reason.
  */
+function finalAssistantMessage(session: AgentSession, startIndex = 0) {
+  for (let i = session.messages.length - 1; i >= startIndex; i--) {
+    const msg = session.messages[i];
+    if (msg.role === "assistant") return msg;
+  }
+  return undefined;
+}
+
 function finalTurnError(session: AgentSession, startIndex = 0): string | undefined {
   for (let i = session.messages.length - 1; i >= startIndex; i--) {
     const msg = session.messages[i];
@@ -494,6 +484,94 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
     return undefined;
   }
   return undefined;
+}
+
+async function promptWithModelFallback(
+  session: AgentSession,
+  prompt: string,
+  options: {
+    candidates?: ModelCandidate[];
+    onBeforeFallback?: () => void;
+    onAttemptStart?: () => void;
+    isAborted?: () => boolean;
+    getCollectedText?: () => string;
+  },
+): Promise<{ text: string; failure?: string; attempts: ModelAttempt[] }> {
+  const candidates = options.candidates?.length
+    ? options.candidates
+    : session.model
+      ? [{ input: `${session.model.provider}/${session.model.id}`, model: session.model }]
+      : [];
+  const attempts: ModelAttempt[] = [];
+  let invocationPrompt = prompt;
+
+  for (let index = 0; index < Math.max(candidates.length, 1); index++) {
+    const candidate = candidates[index];
+    const model = candidate?.model;
+    if (!model) {
+      attempts.push({
+        model: candidate?.input ?? "unknown",
+        status: "unavailable",
+        error: candidate?.error ?? "unavailable",
+      });
+      continue;
+    }
+    if (session.model?.provider !== model.provider || session.model?.id !== model.id) {
+      await session.setModel(model);
+    }
+    const startIndex = session.messages.length;
+    options.onAttemptStart?.();
+    await session.prompt(invocationPrompt);
+    const assistant = finalAssistantMessage(session, startIndex);
+    const failure = finalTurnError(session, startIndex);
+    const modelName = model ? `${model.provider}/${model.id}` : "unknown";
+
+    if (!failure) {
+      if (model) attempts.push({ model: modelName, status: "succeeded" });
+      return { text: options.getCollectedText?.().trim() || getLastAssistantText(session, startIndex), attempts };
+    }
+
+    attempts.push({ model: modelName, status: "failed", error: failure });
+    const fallbackEligible = !options.isAborted?.() && assistant?.stopReason === "error" &&
+      !isContextOverflow(assistant, model.contextWindow ?? 0);
+    const remaining = candidates.slice(index + 1);
+    const hasRunnableFallback = remaining.some(next => next.model !== undefined);
+    if (!fallbackEligible || !hasRunnableFallback) {
+      if (fallbackEligible) {
+        for (const unavailable of remaining) {
+          attempts.push({
+            model: unavailable.input,
+            status: "unavailable",
+            error: unavailable.error ?? "unavailable",
+          });
+        }
+      }
+      return {
+        text: options.getCollectedText?.().trim() || getLastAssistantText(session, startIndex),
+        failure: fallbackEligible && candidates.length > 1
+          ? formatModelAttempts(attempts)
+          : failure,
+        attempts,
+      };
+    }
+
+    options.onBeforeFallback?.();
+    const userEntry = [...session.sessionManager.getBranch()].reverse().find(entry =>
+      entry.type === "message" && entry.message.role === "user",
+    );
+    if (!userEntry) {
+      return { text: options.getCollectedText?.().trim() || getLastAssistantText(session, startIndex), failure, attempts };
+    }
+    const navigation = await session.navigateTree(userEntry.id, { summarize: false });
+    if (navigation.cancelled || navigation.editorText === undefined) {
+      return { text: options.getCollectedText?.().trim() || getLastAssistantText(session, startIndex), failure, attempts };
+    }
+    invocationPrompt = navigation.editorText;
+    // The next loop iteration switches to the next runnable candidate. Any
+    // unavailable entries between attempts are recorded in configured order.
+  }
+
+  return { text: "", failure: formatModelAttempts(attempts), attempts };
 }
 
 /**
@@ -733,10 +811,29 @@ export async function runAgent(
     }
   }
 
-  // Resolve model: explicit option > config.model > parent model
-  const model = options.model ?? resolveDefaultModel(
-    ctx.model, ctx.modelRegistry, agentConfig?.model,
-  );
+  const defaultFallbackModels = options.modelCandidates === undefined
+    ? loadSettings(configCwd).defaultFallbackModels
+    : undefined;
+  const candidateResolution = options.modelCandidates
+    ? { candidates: options.modelCandidates, models: options.modelCandidates.flatMap(candidate => candidate.model ? [candidate.model] : []) }
+    : resolveModelCandidates({
+        primary: options.model ?? (agentConfig?.model ? undefined : ctx.model),
+        primaryInput: options.model ? undefined : agentConfig?.model,
+        callerSupplied: options.callerSuppliedModel,
+        fallbackModels: agentConfig?.fallbackModels,
+        defaultFallbackModels,
+        registry: ctx.modelRegistry,
+      });
+  const model = candidateResolution.models[0];
+  const hasConfiguredModelChain = options.model !== undefined || agentConfig?.model !== undefined ||
+    agentConfig?.fallbackModels !== undefined || (defaultFallbackModels?.length ?? 0) > 0;
+  if (!model && hasConfiguredModelChain) {
+    throw new Error(formatModelAttempts(candidateResolution.candidates.map(candidate => ({
+      model: candidate.input,
+      status: "unavailable",
+      error: candidate.error,
+    }))));
+  }
 
   // Resolve thinking level: explicit option > agent config > undefined (inherit)
   const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
@@ -827,9 +924,14 @@ export async function runAgent(
     sessionExcludeTools = [...denyTools];
   }
 
-  const settingsManager = SettingsManager.create(configCwd, agentDir);
+  const fileSettingsManager = SettingsManager.create(configCwd, agentDir);
+  // Automatic fallback must not persist a child model as the user's default.
+  // Clone effective settings into memory so public AgentSession.setModel()
+  // keeps its auth/model-select/thinking/session semantics without file I/O.
+  const settingsManager = SettingsManager.inMemory(fileSettingsManager.getGlobalSettings());
+  settingsManager.applyOverrides(fileSettingsManager.getProjectSettings());
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
-  const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
+  const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? fileSettingsManager.getSessionDir?.();
   const sessionManager = agentConfig?.persistSession
     ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
     : SessionManager.inMemory(effectiveCwd);
@@ -899,11 +1001,16 @@ export async function runAgent(
 
   options.onSessionCreated?.(session);
 
-  // Track turns for graceful max_turns enforcement
+  // Track turns for graceful max_turns enforcement. Each fallback candidate
+  // receives a fresh budget while lifetime accounting remains aggregated.
   let turnCount = 0;
   const maxTurns = normalizeMaxTurns(options.maxTurns ?? agentConfig?.maxTurns ?? defaultMaxTurns);
   let softLimitReached = false;
   let aborted = false;
+  const resetAttemptTurnBudget = () => {
+    turnCount = 0;
+    softLimitReached = false;
+  };
 
   let currentMessageText = "";
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
@@ -958,19 +1065,27 @@ export async function runAgent(
     }
   }
 
-  // Boundary for the history fallback: only assistant text produced from here
-  // on counts as this run's output (a fresh session, so usually 0).
-  const startLen = session.messages.length;
   try {
-    await session.prompt(effectivePrompt);
+    const result = await promptWithModelFallback(session, effectivePrompt, {
+      candidates: candidateResolution.candidates,
+      onBeforeFallback: options.onBeforeModelFallback,
+      onAttemptStart: resetAttemptTurnBudget,
+      isAborted: () => aborted,
+      getCollectedText: collector.getText,
+    });
+    return {
+      responseText: result.text,
+      session,
+      aborted,
+      steered: softLimitReached,
+      failure: result.failure,
+      modelAttempts: result.attempts,
+    };
   } finally {
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
   }
-
-  const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
-  return { responseText, session, aborted, steered: softLimitReached, failure: finalTurnError(session, startLen) };
 }
 
 /**
@@ -984,12 +1099,11 @@ export async function resumeAgent(
     onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
+    modelCandidates?: ModelCandidate[];
+    onBeforeModelFallback?: () => void;
   } = {},
-): Promise<{ text: string; failure?: string }> {
-  // Boundary for the history fallback: the session already holds prior turns,
-  // so only assistant text produced by THIS resume prompt counts as its output
-  // — a failed resume must not surface the previous turn's answer (#144).
-  const startLen = session.messages.length;
+): Promise<{ text: string; failure?: string; modelAttempts?: ModelAttempt[] }> {
+  // Only assistant text produced by this resume/fallback cycle counts as output.
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
@@ -1012,17 +1126,17 @@ export async function resumeAgent(
     : () => {};
 
   try {
-    await session.prompt(prompt);
+    const result = await promptWithModelFallback(session, prompt, {
+      candidates: options.modelCandidates,
+      onBeforeFallback: options.onBeforeModelFallback,
+      getCollectedText: collector.getText,
+    });
+    return { text: result.text, failure: result.failure, modelAttempts: result.attempts };
   } finally {
     collector.unsubscribe();
     unsubEvents();
     cleanupAbort();
   }
-
-  return {
-    text: collector.getText().trim() || getLastAssistantText(session, startLen),
-    failure: finalTurnError(session, startLen),
-  };
 }
 
 /**

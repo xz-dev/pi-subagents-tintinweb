@@ -16,6 +16,7 @@ export function resolveAgentInvocationConfig(
 ): {
   modelInput?: string;
   modelFromParams: boolean;
+  fallbackModels?: string[] | false;
   thinking?: ThinkingLevel;
   maxTurns?: number;
   inheritContext: boolean;
@@ -27,6 +28,7 @@ export function resolveAgentInvocationConfig(
   return {
     modelInput: requestedModel ?? agentConfig?.model,
     modelFromParams: requestedModel !== undefined,
+    fallbackModels: agentConfig?.fallbackModels,
     thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,

@@ -8,9 +8,12 @@ const {
   defaultResourceLoaderCtor,
   loaderExtensionsRef,
   getAgentDir,
+  getAgentConfig,
   sessionManagerInMemory,
   sessionManagerCreate,
   settingsManagerCreate,
+  settingsManagerInMemory,
+  settingsManagerApplyOverrides,
   settingsManagerGetSessionDir,
 } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
@@ -23,10 +26,32 @@ const {
     },
   },
   getAgentDir: vi.fn(() => "/mock/agent-dir"),
+  getAgentConfig: vi.fn(() => ({
+    name: "Explore",
+    description: "Explore",
+    builtinToolNames: ["read"],
+    extensions: false,
+    skills: false,
+    systemPrompt: "You are Explore.",
+    promptMode: "replace",
+    inheritContext: false,
+    runInBackground: false,
+    isolated: false,
+  })),
   sessionManagerInMemory: vi.fn(() => ({ kind: "memory-session-manager" })),
   sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
   settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
-  settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
+  settingsManagerApplyOverrides: vi.fn(),
+  settingsManagerCreate: vi.fn(() => ({
+    kind: "file-settings-manager",
+    getSessionDir: settingsManagerGetSessionDir,
+    getGlobalSettings: () => ({ retry: { enabled: true } }),
+    getProjectSettings: () => ({ compaction: { enabled: true } }),
+  })),
+  settingsManagerInMemory: vi.fn(() => ({
+    kind: "memory-settings-manager",
+    applyOverrides: settingsManagerApplyOverrides,
+  })),
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
@@ -60,7 +85,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   },
   getAgentDir,
   SessionManager: { inMemory: sessionManagerInMemory, create: sessionManagerCreate },
-  SettingsManager: { create: settingsManagerCreate },
+  SettingsManager: { create: settingsManagerCreate, inMemory: settingsManagerInMemory },
 }));
 
 vi.mock("../src/agent-types.js", () => ({
@@ -73,18 +98,7 @@ vi.mock("../src/agent-types.js", () => ({
     skills: false,
     promptMode: "replace",
   })),
-  getAgentConfig: vi.fn(() => ({
-    name: "Explore",
-    description: "Explore",
-    builtinToolNames: ["read"],
-    extensions: false,
-    skills: false,
-    systemPrompt: "You are Explore.",
-    promptMode: "replace",
-    inheritContext: false,
-    runInBackground: false,
-    isolated: false,
-  })),
+  getAgentConfig,
   getMemoryToolNames: vi.fn(() => []),
   getReadOnlyMemoryToolNames: vi.fn(() => []),
   getToolNamesForType: vi.fn(() => ["read"]),
@@ -167,6 +181,10 @@ function createSession(finalText: string) {
       beforeToolCall?: (context: any, signal?: any) => Promise<any>;
     },
     setSessionName: vi.fn(),
+    navigateTree: vi.fn(),
+    setModel: vi.fn(),
+    model: { provider: "anthropic", id: "primary", contextWindow: 128_000 },
+    sessionManager: { getBranch: vi.fn(() => []) },
     bindExtensions: vi.fn(async () => {}),
   };
   lastSession = session;
@@ -187,11 +205,14 @@ beforeEach(() => {
   createAgentSession.mockReset();
   defaultResourceLoaderCtor.mockClear();
   getAgentDir.mockClear();
+  getAgentConfig.mockClear();
   sessionManagerInMemory.mockClear();
   sessionManagerCreate.mockClear();
   settingsManagerGetSessionDir.mockReset();
   settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
+  settingsManagerInMemory.mockClear();
+  settingsManagerApplyOverrides.mockClear();
   vi.mocked(createNestedSubagentTools).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
   lastSession = undefined;
@@ -205,6 +226,158 @@ describe("agent-runner final output capture", () => {
     const result = await runAgent(ctx, "Explore", "Say LOCKED", { pi });
 
     expect(result.responseText).toBe("LOCKED");
+  });
+
+  it("fails closed when configured candidates are unavailable instead of inheriting the parent", async () => {
+    const parent = { provider: "parent", id: "parent", contextWindow: 128_000 };
+    const { session } = createSession("");
+    createAgentSession.mockResolvedValue({ session });
+    getAgentConfig.mockReturnValueOnce(makeConfig({ model: "anthropic/missing" }) as any);
+    const context = {
+      ...ctx,
+      model: parent,
+      modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    } as any;
+
+    await expect(runAgent(context, "pinned", "go", { pi }))
+      .rejects.toThrow("All model candidates failed");
+    expect(createAgentSession).not.toHaveBeenCalled();
+  });
+
+  it("falls back in the same session through navigateTree, setModel, and prompt", async () => {
+    const primary = { provider: "anthropic", id: "primary", contextWindow: 128_000 };
+    const backup = { provider: "openai", id: "backup", contextWindow: 128_000 };
+    const { session } = createSession("");
+    session.model = primary;
+    session.sessionManager.getBranch.mockReturnValue([
+      { id: "user-1", type: "message", message: { role: "user", content: "go" } },
+    ]);
+    session.navigateTree.mockResolvedValue({ cancelled: false, editorText: "go" });
+    session.setModel.mockImplementation(async (model: typeof backup) => {
+      session.model = model;
+    });
+    session.prompt.mockImplementationOnce(async () => {
+      session.messages.push(
+        {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "transient overload",
+          content: [],
+          usage: {},
+        },
+        {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "quota exhausted",
+          content: [],
+          usage: {},
+        },
+      );
+    }).mockImplementationOnce(async () => {
+      session.messages.push({
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: "backup answer" }],
+        usage: {},
+      });
+    });
+    createAgentSession.mockResolvedValue({ session });
+    const beforeFallback = vi.fn();
+
+    const result = await runAgent(ctx, "Explore", "go", {
+      pi,
+      model: primary,
+      modelCandidates: [
+        { input: "anthropic/primary", model: primary },
+        { input: "openai/backup", model: backup },
+      ],
+      onBeforeModelFallback: beforeFallback,
+      maxTurns: 1,
+    });
+
+    expect(session.prompt).toHaveBeenNthCalledWith(1, "go");
+    expect(session.navigateTree).toHaveBeenCalledWith("user-1", { summarize: false });
+    expect(session.setModel).toHaveBeenCalledWith(backup);
+    expect(session.prompt).toHaveBeenNthCalledWith(2, "go");
+    expect(beforeFallback).toHaveBeenCalledTimes(1);
+    expect(result.responseText).toBe("backup answer");
+    expect(result.responseText).not.toContain("transient overload");
+    expect(result.responseText).not.toContain("quota exhausted");
+    expect(result.failure).toBeUndefined();
+    expect(result.modelAttempts).toEqual([
+      { model: "anthropic/primary", status: "failed", error: "quota exhausted" },
+      { model: "openai/backup", status: "succeeded" },
+    ]);
+  });
+
+  it("keeps unavailable candidates in configured attempt order", async () => {
+    const primary = { provider: "anthropic", id: "primary", contextWindow: 128_000 };
+    const backup = { provider: "google", id: "backup", contextWindow: 128_000 };
+    const { session } = createSession("");
+    session.model = primary;
+    session.sessionManager.getBranch.mockReturnValue([
+      { id: "user-1", type: "message", message: { role: "user", content: "go" } },
+    ]);
+    session.navigateTree.mockResolvedValue({ cancelled: false, editorText: "go" });
+    session.setModel.mockImplementation(async (model: typeof backup) => {
+      session.model = model;
+    });
+    session.prompt.mockImplementationOnce(async () => {
+      session.messages.push({
+        role: "assistant", stopReason: "error", errorMessage: "quota", content: [], usage: {},
+      });
+    }).mockImplementationOnce(async () => {
+      session.messages.push({
+        role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }], usage: {},
+      });
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", {
+      pi,
+      model: primary,
+      modelCandidates: [
+        { input: "anthropic/primary", model: primary },
+        { input: "openai/unavailable", error: "not configured" },
+        { input: "google/backup", model: backup },
+      ],
+    });
+
+    expect(result.modelAttempts).toEqual([
+      { model: "anthropic/primary", status: "failed", error: "quota" },
+      { model: "openai/unavailable", status: "unavailable", error: "not configured" },
+      { model: "google/backup", status: "succeeded" },
+    ]);
+  });
+
+  it("does not fallback on context overflow", async () => {
+    const primary = { provider: "anthropic", id: "primary", contextWindow: 10 };
+    const backup = { provider: "openai", id: "backup", contextWindow: 128_000 };
+    const { session } = createSession("");
+    session.model = primary;
+    session.prompt.mockImplementation(async () => {
+      session.messages.push({
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "prompt is too long: 20 tokens > 10 maximum",
+        content: [],
+        usage: { input: 20, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+      });
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", {
+      pi,
+      model: primary,
+      modelCandidates: [
+        { input: "anthropic/primary", model: primary },
+        { input: "openai/backup", model: backup },
+      ],
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(session.setModel).not.toHaveBeenCalled();
+    expect(result.failure).toContain("prompt is too long");
   });
 
   it("binds extensions before prompting", async () => {
@@ -229,12 +402,17 @@ describe("agent-runner final output capture", () => {
 
     await runAgent(ctx, "Explore", "Say CONFIGURED", { pi, cwd: "/tmp/worktree" });
 
-    expect(getAgentDir).toHaveBeenCalledTimes(1);
+    expect(getAgentDir).toHaveBeenCalledTimes(2);
     expect(defaultResourceLoaderCtor).toHaveBeenCalledWith(expect.objectContaining({
       cwd: "/tmp/worktree",
       agentDir: "/mock/agent-dir",
     }));
     expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir");
+    expect(settingsManagerInMemory).toHaveBeenCalledWith({ retry: { enabled: true } });
+    expect(settingsManagerApplyOverrides).toHaveBeenCalledWith({ compaction: { enabled: true } });
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      settingsManager: expect.objectContaining({ kind: "memory-settings-manager" }),
+    }));
     expect(sessionManagerInMemory).toHaveBeenCalledWith("/tmp/worktree");
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       cwd: "/tmp/worktree",
@@ -687,7 +865,6 @@ describe("getAgentConversation", () => {
 // `lastToolsPassed()` returns what the LLM can actually call under either shape.
 
 import {
-  getAgentConfig,
   getConfig,
   getToolNamesForType,
 } from "../src/agent-types.js";
