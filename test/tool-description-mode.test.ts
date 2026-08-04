@@ -122,6 +122,7 @@ describe("toolDescriptionMode", () => {
       "resume",
       "steer_subagent",
       'isolation: "worktree"',
+      'isolation: "off"',
       ".pi/agents/",
       "self-contained",
     ]) {
@@ -145,6 +146,17 @@ describe("toolDescriptionMode", () => {
       expect(surface.toLowerCase()).toMatch(/never initialize|do not initialize|never init/);
       expect(surface).not.toMatch(/Initialize git and commit at least once/);
     }
+  });
+
+  it("top-level isolation schema accepts off, worktree, or omission", () => {
+    const schema = setup().get("Agent").parameters;
+    const isolation = schema.properties.isolation;
+
+    expect(isolation.anyOf).toEqual([
+      expect.objectContaining({ const: "worktree" }),
+      expect.objectContaining({ const: "off" }),
+    ]);
+    expect(schema.required).not.toContain("isolation");
   });
 
   it("custom mode renders the project template with placeholders substituted", () => {

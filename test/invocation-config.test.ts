@@ -59,6 +59,24 @@ describe("resolveAgentInvocationConfig", () => {
       .toMatchObject({ fallbackModels: false });
   });
 
+  it("lets an explicit off parameter override a configured worktree default", () => {
+    const resolved = resolveAgentInvocationConfig(
+      makeConfig({ isolation: "worktree" }),
+      { isolation: "off" },
+    );
+
+    expect(resolved.isolation).toBeUndefined();
+  });
+
+  it("normalizes a configured off default to no runtime isolation", () => {
+    const resolved = resolveAgentInvocationConfig(
+      makeConfig({ isolation: "off" }),
+      { isolation: "worktree" },
+    );
+
+    expect(resolved.isolation).toBeUndefined();
+  });
+
   it("uses tool-call params when no agent config is available", () => {
     const resolved = resolveAgentInvocationConfig(undefined, {
       model: "provider/param-model",

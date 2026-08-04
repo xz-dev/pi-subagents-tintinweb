@@ -94,6 +94,17 @@ afterEach(() => {
 });
 
 describe("child-safe nested Agent tools", () => {
+  it("exposes off and worktree as optional nested isolation choices", () => {
+    const [agent] = tools();
+    const isolation = (agent.parameters as any).properties.isolation;
+
+    expect(isolation.anyOf).toEqual([
+      expect.objectContaining({ const: "worktree" }),
+      expect.objectContaining({ const: "off" }),
+    ]);
+    expect((agent.parameters as any).required).not.toContain("isolation");
+  });
+
   it("allows any enabled agent when allowed_subagents is omitted", async () => {
     const [agent] = tools();
     const result = await execute(agent, {

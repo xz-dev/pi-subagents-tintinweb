@@ -182,16 +182,22 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
       isolated: Type.Optional(Type.Boolean()),
       inherit_context: Type.Optional(Type.Boolean()),
-      isolation: Type.Optional(
+      isolation: Type.Optional(Type.Union([
         Type.Literal("worktree", {
           description:
-            'Set to "worktree" to run the nested agent in a temporary git worktree (isolated copy of the repo). ' +
-            "Uses the parent session cwd; a repository path mentioned only in the prompt cannot select another worktree base. " +
+            "Run the nested agent in a temporary Git worktree using the parent session cwd. " +
+            "A repository path mentioned only in the prompt cannot select another worktree base. " +
             "Requires an existing Git repository with a valid HEAD/at least one commit. " +
-            "Omit for read-only work or a non-Git cwd. Never initialize or commit a repository solely to enable isolation. " +
-            "Changes are saved to a branch on completion.",
+            "Never initialize or commit a repository solely to enable isolation. Changes are saved to a branch on completion.",
         }),
-      ),
+        Type.Literal("off", {
+          description: "Disable worktree isolation, overriding the nested agent's default.",
+        }),
+      ], {
+        description:
+          'Use "worktree" for an isolated copy or "off" to explicitly run without one. ' +
+          "Omit for the agent default, read-only work, or a non-Git cwd.",
+      })),
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
