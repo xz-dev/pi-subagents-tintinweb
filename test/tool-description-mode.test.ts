@@ -122,6 +122,7 @@ describe("toolDescriptionMode", () => {
       "resume",
       "steer_subagent",
       'isolation: "worktree"',
+      'isolation: "off"',
       ".pi/agents/",
       "self-contained",
       "frontmatter",
@@ -144,7 +145,7 @@ describe("toolDescriptionMode", () => {
     });
     expect(schema.properties.isolation).toMatchObject({
       type: "string",
-      enum: ["worktree"],
+      enum: ["worktree", "off"],
     });
     expect(schema.properties.max_turns).toMatchObject({ type: "integer", minimum: 1 });
   });

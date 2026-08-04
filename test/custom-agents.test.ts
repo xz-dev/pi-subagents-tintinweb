@@ -701,6 +701,18 @@ Isolated.`);
     expect(result.get("isolated-wt")!.isolation).toBe("worktree");
   });
 
+  it("parses isolation: off as an explicit no-worktree default", () => {
+    writeAgent("isolated-off", `---
+description: No worktree agent
+isolation: off
+---
+
+Not isolated.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("isolated-off")!.isolation).toBe("off");
+  });
+
   it("isolation defaults to undefined when omitted", () => {
     writeAgent("no-isolation", `---
 description: Normal

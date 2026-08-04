@@ -17,8 +17,11 @@ export const DEFAULT_AGENT_NAMES = ["general-purpose", "Explore", "Plan"] as con
 /** Memory scope for persistent agent memory. */
 export type MemoryScope = "user" | "project" | "local";
 
-/** Isolation mode for agent execution. */
+/** Effective runtime isolation mode. */
 export type IsolationMode = "worktree";
+
+/** User-configurable isolation preference. `off` normalizes to no runtime isolation. */
+export type IsolationPreference = IsolationMode | "off";
 
 /** Unified agent configuration — used for both default and user-defined agents. */
 export interface AgentConfig {
@@ -64,8 +67,8 @@ export interface AgentConfig {
   isolated?: boolean;
   /** Persistent memory scope — agents with memory get a persistent directory and MEMORY.md */
   memory?: MemoryScope;
-  /** Isolation mode — "worktree" runs the agent in a temporary git worktree */
-  isolation?: IsolationMode;
+  /** Isolation preference — "worktree" uses a temporary worktree; "off" disables it. */
+  isolation?: IsolationPreference;
   /** true = this is an embedded default agent (informational) */
   isDefault?: boolean;
   /** false = agent is hidden from the registry */

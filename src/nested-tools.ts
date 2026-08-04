@@ -32,6 +32,7 @@ import type {
   AgentInvocation,
   AgentRecord,
   IsolationMode,
+  IsolationPreference,
   ModelCandidate,
   ThinkingLevel,
 } from "./types.js";
@@ -179,7 +180,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       resume: Type.Optional(Type.String({ minLength: 1, description: "Owned nested agent ID to continue. When present, only prompt and resume are used; omit all spawn-only options." })),
       isolated: Type.Optional(Type.Boolean({ description: "Disable extension/MCP tools when frontmatter does not define isolated; ignored on resume." })),
       inherit_context: Type.Optional(Type.Boolean({ description: "Fork this parent's context when frontmatter does not define inheritance; ignored on resume." })),
-      isolation: Type.Optional(Type.Unsafe<IsolationMode>(StringEnum(["worktree"] as const, { description: "Run a new child in a temporary Git worktree; ignored on resume." }))),
+      isolation: Type.Optional(Type.Unsafe<IsolationPreference>(StringEnum(["worktree", "off"] as const, { description: "Use worktree for a temporary Git worktree, or off to explicitly disable the child agent's worktree default; ignored on resume." }))),
     }, { additionalProperties: false }),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
@@ -223,7 +224,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const invocation = resolveAgentInvocationConfig(config, {
         ...params,
         thinking: params.thinking as string | undefined,
-        isolation: params.isolation as IsolationMode | undefined,
+        isolation: params.isolation as IsolationPreference | undefined,
       });
       const candidateResolution = resolveModelCandidates({
         primary: invocation.modelInput ? undefined : ctx.model,

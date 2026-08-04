@@ -65,6 +65,17 @@ describe("resolveAgentInvocationConfig", () => {
     },
   );
 
+  it("lets either explicit isolation state override frontmatter", () => {
+    expect(resolveAgentInvocationConfig(
+      makeConfig({ isolation: "worktree" }),
+      { isolation: "off" },
+    ).isolation).toBeUndefined();
+    expect(resolveAgentInvocationConfig(
+      makeConfig({ isolation: "off" }),
+      { isolation: "worktree" },
+    ).isolation).toBe("worktree");
+  });
+
   it("resolves per-agent fallback precedence without exposing a per-call override", () => {
     expect(resolveAgentInvocationConfig(makeConfig({ fallbackModels: ["provider/a"] }), {}))
       .toMatchObject({ fallbackModels: ["provider/a"] });
