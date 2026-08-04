@@ -44,11 +44,13 @@ Keep the configuration deliberately narrow:
 
 ### Primary model and explicit caller model
 
-Primary selection remains:
+Primary selection is:
 
-1. Agent frontmatter `model` (authoritative).
-2. Otherwise caller `Agent({ model })`.
+1. A trimmed nonblank caller `Agent({ model })` overrides agent frontmatter.
+2. Otherwise use agent frontmatter `model`.
 3. Otherwise inherit the parent session model. An inherited parent model is a normal non-explicit primary and therefore uses `defaultFallbackModels` when the agent does not override/disable them.
+
+Blank/whitespace caller model values are omission, not explicit selection.
 
 When the effective primary came from caller `Agent({ model })`:
 

@@ -209,6 +209,7 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
       subscribe: vi.fn(() => vi.fn()),
       prompt: vi.fn(),
       state: { messages: [] },
+      model: { provider: "faux", id: "faux-1", name: "Faux" },
     } as any;
     vi.mocked(runAgent)
       .mockResolvedValueOnce({ responseText: "first", session, aborted: false, steered: false })

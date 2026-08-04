@@ -43,8 +43,15 @@ describe("model fallback invocation wiring", () => {
     expect(resolved.models).toEqual(models);
   });
 
-  it("an explicit caller model suppresses both per-agent and default fallbacks", () => {
-    const invocation = resolveAgentInvocationConfig(config(), { model: "anthropic/primary" });
+  it("an explicit caller model overrides frontmatter and suppresses all fallbacks", () => {
+    const invocation = resolveAgentInvocationConfig(config({
+      model: "openai/backup",
+      fallbackModels: ["openai/backup"],
+    }), { model: "  anthropic/primary  " });
+    expect(invocation).toMatchObject({
+      modelInput: "anthropic/primary",
+      modelFromParams: true,
+    });
     const resolved = resolveModelCandidates({
       primaryInput: invocation.modelInput,
       callerSupplied: invocation.modelFromParams,
@@ -53,5 +60,23 @@ describe("model fallback invocation wiring", () => {
     });
 
     expect(resolved.models).toEqual([models[0]]);
+    expect(resolved.candidates).toEqual([{ input: "anthropic/primary", model: models[0] }]);
+  });
+
+  it("a blank caller model remains omitted and preserves the configured chain", () => {
+    const invocation = resolveAgentInvocationConfig(config({
+      model: "anthropic/primary",
+      fallbackModels: ["openai/backup"],
+    }), { model: "  " });
+    const resolved = resolveModelCandidates({
+      primaryInput: invocation.modelInput,
+      callerSupplied: invocation.modelFromParams,
+      fallbackModels: invocation.fallbackModels,
+      defaultFallbackModels: ["openai/backup"],
+      registry,
+    });
+
+    expect(invocation.modelFromParams).toBe(false);
+    expect(resolved.models).toEqual(models);
   });
 });
