@@ -4,7 +4,9 @@
  * a string. Drives the registered `Agent` / `get_subagent_result` tools and
  * inspects the text delivered back, for a turn-limit abort and a user stop.
  */
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentRecord } from "../src/types.js";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -108,11 +110,10 @@ describe("Agent tool model display", () => {
       }).render(120).join("\n");
       expect(collapsed).toContain("openai-codex/gpt-5.6-sol");
       expect(expanded).toContain("openai-codex/gpt-5.6-sol");
-      expect(collapsed).toContain("thinking:");
-      expect(expanded).toContain("thinking:");
+      expect(collapsed).toContain("thinking: xhigh");
+      expect(expanded).toContain("thinking: xhigh");
       expect(collapsed).not.toContain("Ambiguous Display Name");
     }
-    expect(result.details.tags).toContain("thinking: xhigh");
   });
 
   it("shows the canonical pre-session model in the immediate background result", async () => {
@@ -195,6 +196,112 @@ describe("Agent tool model display", () => {
     expect(rendered).toContain("anthropic/claude-sonnet-4-6");
     expect(rendered).toContain("thinking: medium");
     expect(rendered).not.toContain("google/gemini-3-pro");
+  });
+});
+
+describe("get_subagent_result rendering", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("collapses completed reports and expands the unchanged full payload", async () => {
+    initTheme("dark");
+    const payload = "first report line\nsecond report line\nthird report line";
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: payload,
+      session: { dispose: vi.fn() } as any,
+      aborted: false,
+      steered: false,
+    });
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+
+    const spawn = await tools.get("Agent").execute(
+      "tc-result-render",
+      { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: true },
+      undefined, undefined, ctx(),
+    );
+    const id = textOf(spawn).match(/Agent ID: (\S+)/)?.[1];
+    expect(id, "background spawn should surface an agent id").toBeTruthy();
+
+    const result = await tools.get("get_subagent_result").execute(
+      "tc-result-read", { agent_id: id, wait: true }, undefined, undefined, ctx(),
+    );
+    expect(textOf(result)).toContain("Status: completed");
+    expect(textOf(result)).toContain(payload);
+
+    const renderer = tools.get("get_subagent_result").renderResult;
+    const theme = { fg: (_color: string, text: string) => text };
+    const collapsed = renderer(result, { expanded: false, isPartial: false }, theme).render(120).join("\n");
+    const expanded = renderer(result, { expanded: true, isPartial: false }, theme).render(120).join("\n");
+
+    expect(collapsed).not.toContain("second report line");
+    expect(collapsed).toContain("to expand");
+    for (const line of textOf(result).split("\n")) {
+      expect(expanded).toContain(line);
+    }
+  });
+
+  const rendererCases: Record<AgentRecord["status"], { collapses: boolean }> = {
+    queued: { collapses: false },
+    running: { collapses: false },
+    completed: { collapses: true },
+    steered: { collapses: true },
+    aborted: { collapses: true },
+    stopped: { collapses: true },
+    error: { collapses: false },
+  };
+  it.each(Object.entries(rendererCases))("renders %s status according to its classification", (status, { collapses }) => {
+    initTheme("dark");
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    const renderer = tools.get("get_subagent_result").renderResult;
+    const payload = "first report line\nsecond report line\nthird report line";
+    const theme = { fg: (_color: string, text: string) => text };
+    const rendered = renderer(
+      { content: [{ type: "text", text: payload }], details: { status } },
+      { expanded: false, isPartial: false },
+      theme,
+    ).render(120).join("\n");
+
+    for (const line of payload.split("\n")) {
+      if (collapses) {
+        expect(rendered).not.toContain(line);
+      } else {
+        expect(rendered).toContain(line);
+      }
+    }
+    if (collapses) {
+      expect(rendered).toContain("to expand");
+    } else {
+      expect(rendered).not.toContain("to expand");
+    }
+  });
+
+  const visibleOverrides: Array<{
+    name: string;
+    details: { status: AgentRecord["status"] } | undefined;
+    options?: { expanded?: boolean; isPartial?: boolean };
+  }> = [
+    { name: "missing details", details: undefined },
+    { name: "partial render", details: { status: "completed" }, options: { isPartial: true } },
+    { name: "expanded render", details: { status: "completed" }, options: { expanded: true } },
+  ];
+  it.each(visibleOverrides)("keeps every payload line visible for $name", ({ details, options }) => {
+    initTheme("dark");
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    const renderer = tools.get("get_subagent_result").renderResult;
+    const payload = "first report line\nsecond report line\nthird report line";
+    const theme = { fg: (_color: string, text: string) => text };
+    const rendered = renderer(
+      { content: [{ type: "text", text: payload }], details },
+      { expanded: false, isPartial: false, ...options },
+      theme,
+    ).render(120).join("\n");
+
+    for (const line of payload.split("\n")) {
+      expect(rendered).toContain(line);
+    }
+    expect(rendered).not.toContain("to expand");
   });
 });
 
