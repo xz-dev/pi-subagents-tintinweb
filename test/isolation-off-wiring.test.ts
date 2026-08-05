@@ -58,12 +58,12 @@ let previousAgentDir: string | undefined;
 let previousHome: string | undefined;
 let shutdowns: Array<() => Promise<void>>;
 
-function writeWorktreeAgent(name: string, nested = false) {
+function writeWorktreeAgent(name: string, nested = false, model?: string) {
   const dir = join(cwd, ".pi", "agents");
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, `${name}.md`),
-    `---\ndescription: Worktree agent\ntools: read\nisolation: worktree\n${nested ? "allowed_subagents: all\n" : ""}---\nAgent.\n`,
+    `---\ndescription: Worktree agent\ntools: read\nisolation: worktree\n${model ? `model: ${model}\n` : ""}${nested ? "allowed_subagents: all\n" : ""}---\nAgent.\n`,
   );
 }
 
@@ -152,6 +152,34 @@ describe("explicit Agent isolation opt-out", () => {
     );
     expect(jobs).toHaveLength(1);
     expect(jobs[0]).not.toHaveProperty("isolation");
+  });
+
+  it("persists a frontmatter-only model for a scheduled call", async () => {
+    writeWorktreeAgent("scheduled-model", false, "faux/faux-1");
+    const { pi, tools, handlers } = makePi();
+    subagentsExtension(pi);
+    shutdowns.push(async () => handlers.get("session_shutdown")?.({}, context(cwd)));
+    await handlers.get("session_start")({}, context(cwd));
+
+    await tools.get("Agent").execute(
+      "call-scheduled-model",
+      {
+        prompt: "Do model work later",
+        description: "schedule frontmatter model",
+        subagent_type: "scheduled-model",
+        schedule: "+1h",
+      },
+      undefined,
+      undefined,
+      context(cwd),
+    );
+
+    const storeDir = join(cwd, ".pi", "subagent-schedules");
+    const jobs = readdirSync(storeDir).flatMap((file) =>
+      JSON.parse(readFileSync(join(storeDir, file), "utf-8")).jobs ?? [],
+    );
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].model).toBe("faux/faux-1");
   });
 
   it("lets a nested tool call override a custom worktree default", async () => {

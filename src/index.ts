@@ -1326,7 +1326,7 @@ Terse command-style prompts produce shallow, generic work.
             // at fire time, and the original is what a user edits.
             subagent_type: requestedType,
             prompt: params.prompt as string,
-            model: params.model as string | undefined,
+            model: candidateResolution?.candidates[0]?.input ?? resolvedConfig.modelInput,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
             isolated: isolated,

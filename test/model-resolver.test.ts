@@ -137,12 +137,21 @@ describe("resolveModel", () => {
     });
   });
 
-  describe("provider fallback (prefer named provider, else any)", () => {
+  describe("provider-qualified scope", () => {
     const gatewayHaiku = { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "openrouter" };
+    const namespacedGatewayHaiku = { id: "anthropic/claude-haiku-4-5", name: "Claude Haiku", provider: "openrouter" };
     const anthropicHaiku = { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "anthropic" };
 
-    it("falls back to another provider when the named one lacks the model", () => {
-      expect(resolveModel("anthropic/claude-haiku-4-5", makeRegistry([gatewayHaiku]))).toEqual(gatewayHaiku);
+    it("rejects the same model ID from another provider", () => {
+      expect(resolveModel("anthropic/claude-haiku-4-5", makeRegistry([gatewayHaiku])))
+        .toContain('Model not found: "anthropic/claude-haiku-4-5"');
+    });
+
+    it("does not match a gateway model ID namespaced with the requested provider", () => {
+      expect(resolveModel("anthropic/claude-haiku-4-5", makeRegistry([namespacedGatewayHaiku])))
+        .toContain('Model not found: "anthropic/claude-haiku-4-5"');
+      expect(resolveModel("anthropic/haiku", makeRegistry([namespacedGatewayHaiku])))
+        .toContain('Model not found: "anthropic/haiku"');
     });
 
     it("prefers the named provider when it has the model", () => {

@@ -42,9 +42,15 @@ export function resolveModel(
     }
   }
 
-  // 2. Fuzzy match against available models. Normalize separators so cosmetic
-  // punctuation differences still match — e.g. "claude-haiku-4.5" and
-  // "claude-haiku-4-5" (dot vs dash in the version) resolve to the same model.
+  // 2. Fuzzy match against available models. Provider-qualified selectors are
+  // restricted before scoring so gateway model IDs that contain another
+  // provider's name cannot escape the explicit provider boundary.
+  const provider = slashIdx === -1 ? undefined : input.slice(0, slashIdx).toLowerCase();
+  const candidates = provider === undefined
+    ? all
+    : all.filter(model => model.provider.toLowerCase() === provider);
+  // Normalize separators so cosmetic punctuation differences still match —
+  // e.g. "claude-haiku-4.5" and "claude-haiku-4-5" resolve to the same model.
   const normalize = (s: string) => s.toLowerCase().replace(/\./g, "-");
   const query = normalize(input);
 
@@ -52,7 +58,7 @@ export function resolveModel(
   let bestMatches: ModelEntry[] = [];
   let bestScore = 0;
 
-  for (const m of all) {
+  for (const m of candidates) {
     const id = normalize(m.id);
     const name = normalize(m.name);
     const full = normalize(`${m.provider}/${m.id}`);
@@ -93,16 +99,11 @@ export function resolveModel(
     if (found) return found;
   }
 
-  // 3. Provider fallback: a "provider/modelId" query that didn't match under the
-  // named provider (exact or fuzzy above) retries against all providers. The
-  // named provider is preferred when present; this only kicks in when it isn't,
-  // so the same model from another provider beats falling back to "inherit".
-  if (slashIdx !== -1) {
-    const bare = resolveModel(input.slice(slashIdx + 1), registry);
-    if (typeof bare !== "string") return bare;
-  }
+  // 3. No match — provider-qualified selectors stay provider-scoped. Callers
+  // that want cross-provider choice must list those providers explicitly in a
+  // fallback chain.
 
-  // 4. No match — list available models
+  // 4. List available models
   const modelList = all
     .map(m => `  ${m.provider}/${m.id}`)
     .sort()
