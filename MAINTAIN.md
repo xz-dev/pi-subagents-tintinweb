@@ -38,8 +38,9 @@ The enabled patch order at the time this file was introduced is:
 9. `origin/fix/steer-completion-notifications` — upstream PR #190
 10. `origin/fix/agent-tool-error-rendering` — upstream PR #195
 11. `origin/test/oauth-session-regression` — upstream PR #198
-12. `origin/feat/fallback-models` — downstream-only fallback model chains (no upstream PR)
-13. `origin/fix/explicit-isolation-off` — downstream explicit `Agent` isolation opt-out, independently implemented with upstream PR #201 as prior art
+12. `origin/fix/agent-tool-contracts` — upstreamable Agent model/tool/schema/RPC contract repair (no upstream PR yet)
+13. `origin/feat/fallback-models` — downstream-only fallback model chains refreshed onto the contract repair (no upstream PR)
+14. `origin/fix/explicit-isolation-off` — downstream explicit `Agent` isolation opt-out refreshed onto both model patches, independently implemented with upstream PR #201 as prior art
 
 When integrating PR #154 immediately after PR #168, resolve their overlapping
 `buildInvocationTags()` hunk by preserving PR #154's raw-metadata contract:
