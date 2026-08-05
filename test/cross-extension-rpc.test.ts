@@ -29,6 +29,34 @@ describe("cross-extension RPC", () => {
     deps = { events, pi: { events }, getCtx: () => ctx, manager };
   });
 
+  describe("request validation", () => {
+    it("ignores malformed requests without a usable reply address", async () => {
+      registerRpcHandlers(deps);
+      expect(() => events.emit("subagents:rpc:spawn", null)).not.toThrow();
+      expect(() => events.emit("subagents:rpc:spawn", { requestId: 42 })).not.toThrow();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(manager.spawn).not.toHaveBeenCalled();
+    });
+
+    it("replies with an error for malformed requests that have a requestId", async () => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-invalid", reply);
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-invalid",
+        type: "Explore",
+        prompt: 42,
+      });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply).toHaveBeenCalledWith({
+        success: false,
+        error: expect.stringContaining("prompt must be a non-empty string"),
+      });
+      expect(manager.spawn).not.toHaveBeenCalled();
+    });
+  });
+
   // --- ping ---
 
   describe("ping RPC", () => {
@@ -83,19 +111,93 @@ describe("cross-extension RPC", () => {
       );
     });
 
-    it("passes options through to manager.spawn", async () => {
+    it("passes allowed serializable options through to manager.spawn", async () => {
       registerRpcHandlers(deps);
       const reply = vi.fn();
       events.on("subagents:rpc:spawn:reply:req-s2", reply);
       events.emit("subagents:rpc:spawn", {
         requestId: "req-s2", type: "Explore", prompt: "find it",
-        options: { description: "search", isBackground: true },
+        options: { description: "search", isBackground: true, maxTurns: 4 },
       });
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       expect(manager.spawn).toHaveBeenCalledWith(
         deps.pi, ctx, "Explore", "find it",
-        { description: "search", isBackground: true },
+        { description: "search", isBackground: true, maxTurns: 4 },
+      );
+    });
+
+    it("rejects unknown and internal spawn options", async () => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-options", reply);
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-options",
+        type: "Explore",
+        prompt: "find it",
+        options: { description: "search", parentAgentId: "victim", bypassQueue: true },
+      });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply).toHaveBeenCalledWith({
+        success: false,
+        error: expect.stringContaining("Unsupported spawn option"),
+      });
+      expect(manager.spawn).not.toHaveBeenCalled();
+    });
+
+    it("rejects invalid option types", async () => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-types", reply);
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-types",
+        type: "Explore",
+        prompt: "find it",
+        options: { maxTurns: -1 },
+      });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply).toHaveBeenCalledWith({
+        success: false,
+        error: expect.stringContaining("options.maxTurns"),
+      });
+      expect(manager.spawn).not.toHaveBeenCalled();
+    });
+
+    it("rejects unsupported thinking levels", async () => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-thinking", reply);
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-thinking",
+        type: "Explore",
+        prompt: "find it",
+        options: { thinkingLevel: "unbounded" },
+      });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(reply).toHaveBeenCalledWith({
+        success: false,
+        error: expect.stringContaining("options.thinkingLevel must be one of"),
+      });
+      expect(manager.spawn).not.toHaveBeenCalled();
+    });
+
+    it("passes supported thinking levels through", async () => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-thinking-ok", reply);
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-thinking-ok",
+        type: "Explore",
+        prompt: "find it",
+        options: { thinkingLevel: "high" },
+      });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(manager.spawn).toHaveBeenCalledWith(
+        deps.pi, ctx, "Explore", "find it", { thinkingLevel: "high" },
       );
     });
 

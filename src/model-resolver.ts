@@ -1,5 +1,5 @@
 /**
- * Model resolution: strict provider-qualified lookup with unique fuzzy matching.
+ * Model resolution: exact match ("provider/modelId") with fuzzy fallback.
  */
 
 export interface ModelEntry {
@@ -14,84 +14,98 @@ export interface ModelRegistry {
   getAvailable?(): any[];
 }
 
-const normalize = (value: string) => value.toLowerCase().replace(/\./g, "-");
-
-function scoreModel(input: string, model: ModelEntry, includeProvider: boolean): number {
-  const query = normalize(input);
-  const id = normalize(model.id);
-  const name = normalize(model.name);
-  const full = normalize(`${model.provider}/${model.id}`);
-
-  if (id === query || (includeProvider && full === query)) return 100;
-  if (id.includes(query) || (includeProvider && full.includes(query))) {
-    return 60 + (query.length / id.length) * 30;
-  }
-  if (name.includes(query)) return 40 + (query.length / name.length) * 20;
-
-  const parts = query.split(/[\s/_-]+/).filter(Boolean);
-  if (parts.length > 1 && parts.every(part => id.includes(part) || name.includes(part) || (includeProvider && full.includes(part)))) {
-    return 30 + parts.length;
-  }
-
-  const dateSuffix = /[-.]?\d{8}$/;
-  if (dateSuffix.test(id) || dateSuffix.test(query)) {
-    const idBase = id.replace(dateSuffix, "");
-    const queryBase = query.replace(dateSuffix, "");
-    if (idBase === queryBase) return 95;
-    if (idBase.includes(queryBase) || queryBase.includes(idBase)) {
-      return 55 + (Math.min(idBase.length, queryBase.length) / Math.max(idBase.length, queryBase.length)) * 30;
-    }
-  }
-
-  return 0;
-}
-
 /**
- * Resolve a model string to an available Model instance.
- *
- * Provider-qualified inputs stay inside that provider. Bare/fuzzy inputs are
- * accepted only when the best match is unique across providers.
+ * Resolve a model string to a Model instance.
+ * Tries exact match first ("provider/modelId"), then fuzzy match against all available models.
+ * Returns the Model on success, or an error message string on failure.
  */
-export function resolveModel(input: string, registry: ModelRegistry): any | string {
-  const available = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
+export function resolveModel(
+  input: string,
+  registry: ModelRegistry,
+): any | string {
+  // Available models (those with auth configured)
+  const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
   if (!input.trim()) {
-    const list = available.map(model => `  ${model.provider}/${model.id}`).join("\n");
+    const list = all.map(m => `  ${m.provider}/${m.id}`).sort().join("\n");
     return `Model not found: "${input}".\n\nAvailable models:\n${list}`;
   }
+  const availableSet = new Set(all.map(m => `${m.provider}/${m.id}`.toLowerCase()));
+
+  // 1. Exact match: "provider/modelId" — only if available (has auth)
   const slashIdx = input.indexOf("/");
-  const provider = slashIdx === -1 ? undefined : input.slice(0, slashIdx);
-  const query = slashIdx === -1 ? input : input.slice(slashIdx + 1);
-  const candidates = provider
-    ? available.filter(model => model.provider.toLowerCase() === provider.toLowerCase())
-    : available;
-
-  if (provider) {
-    const exact = candidates.find(model => normalize(model.id) === normalize(query));
-    if (exact) return registry.find(exact.provider, exact.id) ?? exact;
-  }
-
-  let bestScore = 0;
-  let bestMatches: ModelEntry[] = [];
-  for (const model of candidates) {
-    const score = scoreModel(query, model, provider === undefined);
-    if (score > bestScore) {
-      bestScore = score;
-      bestMatches = [model];
-    } else if (score > 0 && score === bestScore) {
-      bestMatches.push(model);
+  if (slashIdx !== -1) {
+    const provider = input.slice(0, slashIdx);
+    const modelId = input.slice(slashIdx + 1);
+    if (availableSet.has(input.toLowerCase())) {
+      const found = registry.find(provider, modelId);
+      if (found) return found;
     }
   }
 
-  const providers = new Set(bestMatches.map(model => model.provider.toLowerCase()));
-  if (bestMatches.length > 1 && providers.size > 1) {
-    const matches = bestMatches.map(model => `${model.provider}/${model.id}`).sort().join(", ");
-    return `Model "${input}" is ambiguous: ${matches}. Use an explicit provider/model.`;
-  }
-  if (bestMatches.length > 0) {
-    const best = bestMatches[0];
-    return registry.find(best.provider, best.id) ?? best;
+  // 2. Fuzzy match against available models. Normalize separators so cosmetic
+  // punctuation differences still match — e.g. "claude-haiku-4.5" and
+  // "claude-haiku-4-5" (dot vs dash in the version) resolve to the same model.
+  const normalize = (s: string) => s.toLowerCase().replace(/\./g, "-");
+  const query = normalize(input);
+
+  // Score each model: prefer exact id match > id contains > name contains > provider+id contains
+  let bestMatches: ModelEntry[] = [];
+  let bestScore = 0;
+
+  for (const m of all) {
+    const id = normalize(m.id);
+    const name = normalize(m.name);
+    const full = normalize(`${m.provider}/${m.id}`);
+
+    let score = 0;
+    if (id === query || full === query) {
+      score = 100; // exact
+    } else if (id.includes(query) || full.includes(query)) {
+      score = 60 + (query.length / id.length) * 30; // substring, prefer tighter matches
+    } else if (name.includes(query)) {
+      score = 40 + (query.length / name.length) * 20;
+    } else if (
+      // A trailing date-stamp token (e.g. "20251001") is optional, so a
+      // date-pinned config like "claude-haiku-4-5-20251001" still matches an
+      // undated registry id like "claude-haiku-4-5".
+      query
+        .split(/[\s\-/]+/)
+        .every(part => /^\d{8}$/.test(part) || id.includes(part) || name.includes(part) || m.provider.toLowerCase().includes(part))
+    ) {
+      score = 20; // all parts present somewhere
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatches = [m];
+    } else if (score > 0 && score === bestScore) {
+      bestMatches.push(m);
+    }
   }
 
-  const list = available.map(model => `  ${model.provider}/${model.id}`).join("\n");
-  return `Model not found: "${input}".\n\nAvailable models:\n${list}`;
+  if (bestMatches.length > 1 && bestScore >= 20) {
+    const matches = bestMatches.map(m => `${m.provider}/${m.id}`).sort().join(", ");
+    return `Model "${input}" is ambiguous: ${matches}. Use an explicit provider/model.`;
+  }
+  if (bestMatches.length === 1 && bestScore >= 20) {
+    const bestMatch = bestMatches[0];
+    const found = registry.find(bestMatch.provider, bestMatch.id);
+    if (found) return found;
+  }
+
+  // 3. Provider fallback: a "provider/modelId" query that didn't match under the
+  // named provider (exact or fuzzy above) retries against all providers. The
+  // named provider is preferred when present; this only kicks in when it isn't,
+  // so the same model from another provider beats falling back to "inherit".
+  if (slashIdx !== -1) {
+    const bare = resolveModel(input.slice(slashIdx + 1), registry);
+    if (typeof bare !== "string") return bare;
+  }
+
+  // 4. No match — list available models
+  const modelList = all
+    .map(m => `  ${m.provider}/${m.id}`)
+    .sort()
+    .join("\n");
+  return `Model not found: "${input}".\n\nAvailable models:\n${modelList}`;
 }

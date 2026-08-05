@@ -138,9 +138,8 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     subagentsExtension(pi);
     const { res, id } = await runForegroundSteeredAgent(tools);
 
-    // The inline result exposes the accepted, resumable turn-limit outcome.
-    expect(textOf(res)).toContain("status: steered");
-    expect(textOf(res)).toContain("category: max_turns");
+    // The inline result is the turn-limit wrap-up the reporter described.
+    expect(textOf(res)).toContain("wrapped up at the turn limit");
 
     // No /new, no /resume, no session switch — exactly the reporter's sequence.
     const read = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
@@ -151,15 +150,18 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
-  it("hands the model the accepted foreground agent id for same-session resume", async () => {
+  it("never hands the model an agent id — the id lives only in renderer details", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
     const { res, id } = await runForegroundSteeredAgent(tools);
 
-    expect(textOf(res)).toContain(`agent_id: ${id}`);
-    expect(textOf(res)).toContain("recovery: resume_same_agent");
-    expect(textOf(res)).toContain("fresh_spawn: forbidden");
+    // `content` is the only thing serialized to the API. If the id isn't here,
+    // the model cannot have obtained it — any id it passes is invented.
+    expect(textOf(res)).not.toContain(id);
+    expect(textOf(res)).not.toMatch(/Agent ID:/);
 
+    // An invented id is correctly rejected — this is the reporter's error,
+    // reproduced WITHOUT any record having been cleaned up.
     await expect(tools.get("get_subagent_result").execute(
       "tc-bogus",
       { agent_id: "3f1320a7-74ec-422" },
@@ -208,13 +210,9 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     // them. This is the ONLY path that makes a foreground id stop resolving.
     await lifecycle.get("session_before_switch")?.();
 
-    await expect(tools.get("get_subagent_result").execute(
-      "tc-read",
-      { agent_id: id },
-      undefined,
-      undefined,
-      ctx(),
-    )).rejects.toThrow("Agent not found");
+    await expect(
+      tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx()),
+    ).rejects.toThrow("Agent not found");
 
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });

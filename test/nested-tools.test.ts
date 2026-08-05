@@ -13,7 +13,6 @@ let manager: NestedAgentManager;
 let records: Map<string, any>;
 let spawn: ReturnType<typeof vi.fn>;
 let spawnAndWait: ReturnType<typeof vi.fn>;
-let originalAgentDir: string | undefined;
 
 function writeAgent(name: string, extra = "") {
   const dir = join(cwd, ".pi", "agents");
@@ -29,7 +28,7 @@ const MODELS = [
 function ctx(executionCwd = cwd) {
   return {
     cwd: executionCwd,
-    model: MODELS[0],
+    model: undefined,
     modelRegistry: {
       find: (provider: string, id: string) => ({ provider, id }),
       getAvailable: () => MODELS,
@@ -61,8 +60,6 @@ async function execute(tool: any, params: Record<string, unknown>, executionCwd 
 
 beforeEach(() => {
   cwd = mkdtempSync(join(tmpdir(), "nested-tools-test-"));
-  originalAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = join(cwd, ".pi", "agent");
   writeAgent("scout");
   writeAgent("reviewer");
   registerAgents(loadCustomAgents(cwd));
@@ -88,32 +85,33 @@ beforeEach(() => {
 
 afterEach(() => {
   setScopeModelsEnabled(false);
-  if (originalAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
-  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   rmSync(cwd, { recursive: true, force: true });
 });
 
 describe("child-safe nested Agent tools", () => {
-  it("exposes off and worktree as optional nested isolation choices", () => {
-    const [agent] = tools();
-    const isolation = (agent.parameters as any).properties.isolation;
-
-    expect(isolation.anyOf).toEqual([
-      expect.objectContaining({ const: "worktree" }),
-      expect.objectContaining({ const: "off" }),
-    ]);
-    expect((agent.parameters as any).required).not.toContain("isolation");
+  it("publishes strict Google-compatible schemas for every nested tool", () => {
+    const [agent, getResult, steer] = tools();
+    for (const tool of [agent, getResult, steer]) {
+      expect((tool.parameters as any).additionalProperties, tool.name).toBe(false);
+    }
+    expect((agent.parameters as any).properties.thinking).toMatchObject({
+      type: "string",
+      enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    });
+    expect((agent.parameters as any).properties.isolation).toMatchObject({
+      type: "string",
+      enum: ["worktree"],
+    });
   });
 
   it("allows any enabled agent when allowed_subagents is omitted", async () => {
     const [agent] = tools();
-    const result = await execute(agent, {
+    await execute(agent, {
       subagent_type: "reviewer",
       description: "review evidence",
       prompt: "Review it",
     });
 
-    expect(result.isError).toBe(false);
     expect(spawnAndWait).toHaveBeenCalledWith(
       expect.anything(), expect.anything(), "reviewer", "Review it",
       expect.objectContaining({
@@ -134,14 +132,11 @@ describe("child-safe nested Agent tools", () => {
 
     try {
       const [agent] = tools();
-      const result = await execute(agent, {
+      await expect(execute(agent, {
         subagent_type: "intruder",
         description: "untrusted agent",
         prompt: "Do work",
-      }, workCwd);
-
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("Unknown or disabled");
+      }, workCwd)).rejects.toThrow("Unknown or disabled");
       expect(spawnAndWait).not.toHaveBeenCalled();
     } finally {
       rmSync(workCwd, { recursive: true, force: true });
@@ -150,21 +145,18 @@ describe("child-safe nested Agent tools", () => {
 
   it("enforces a narrow allowlist", async () => {
     const [limited] = tools(["scout"]);
-    const denied = await execute(limited, {
+    await expect(execute(limited, {
       subagent_type: "reviewer",
       description: "review evidence",
       prompt: "Review it",
-    });
-    expect(denied.isError).toBe(true);
-    expect(denied.content[0].text).toContain("not allowed");
+    })).rejects.toThrow("not allowed");
     expect(spawnAndWait).not.toHaveBeenCalled();
 
-    const allowed = await execute(limited, {
+    await execute(limited, {
       subagent_type: "scout",
       description: "find files",
       prompt: "Find them",
     });
-    expect(allowed.isError).toBe(false);
     expect(spawnAndWait).toHaveBeenCalledTimes(1);
   });
 
@@ -179,14 +171,13 @@ describe("child-safe nested Agent tools", () => {
 
     try {
       const [agent] = tools("all", 1, 2, otherCwd);
-      const result = await execute(agent, {
+      await execute(agent, {
         subagent_type: "branch-only",
         description: "branch agent",
         prompt: "Do work",
       });
 
       // Resolved from the inherited root...
-      expect(result.isError).toBe(false);
       // ...without leaking it into the shared registry.
       expect(getAvailableTypes()).toEqual(before);
       expect(getAvailableTypes()).not.toContain("branch-only");
@@ -203,23 +194,20 @@ describe("child-safe nested Agent tools", () => {
     setScopeModelsEnabled(true);
     const [agent] = tools();
 
-    const blocked = await execute(agent, {
+    await expect(execute(agent, {
       subagent_type: "scout",
       description: "find files",
       prompt: "Find them",
       model: "anthropic/blocked",
-    });
-    expect(blocked.isError).toBe(true);
-    expect(blocked.content[0].text).toContain("Model not in scope");
+    })).rejects.toThrow("Model not in scope");
     expect(spawnAndWait).not.toHaveBeenCalled();
 
-    const inScope = await execute(agent, {
+    await execute(agent, {
       subagent_type: "scout",
       description: "find files",
       prompt: "Find them",
       model: "anthropic/allowed",
     });
-    expect(inScope.isError).toBe(false);
   });
 
   it("queues a steer for an owned child whose session is not ready yet", async () => {
@@ -231,22 +219,18 @@ describe("child-safe nested Agent tools", () => {
     };
     records.set("child-1", record);
 
-    const result = await execute(steer, { agent_id: "child-1", message: "focus on tests" });
+    await execute(steer, { agent_id: "child-1", message: "focus on tests" });
 
-    expect(result.isError).toBe(false);
     expect(record.pendingSteers).toEqual(["focus on tests"]);
   });
 
   it("blocks delegation at the inherited depth cap", async () => {
     const [agent] = tools("all", 2, 2);
-    const result = await execute(agent, {
+    await expect(execute(agent, {
       subagent_type: "scout",
       description: "find files",
       prompt: "Find them",
-    });
-
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("depth=2, max=2");
+    })).rejects.toThrow("depth=2, max=2");
     expect(spawnAndWait).not.toHaveBeenCalled();
   });
 
@@ -256,13 +240,11 @@ describe("child-safe nested Agent tools", () => {
     const [agent] = tools();
 
     for (const subagentType of ["missing", "disabled"]) {
-      const result = await execute(agent, {
+      await expect(execute(agent, {
         subagent_type: subagentType,
         description: "invalid agent",
         prompt: "Do work",
-      });
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("Unknown or disabled");
+      })).rejects.toThrow("Unknown or disabled");
     }
   });
 
@@ -281,7 +263,7 @@ describe("child-safe nested Agent tools", () => {
     );
 
     const own = await execute(getResult, { agent_id: "child-1" });
-    expect(own.isError).toBe(false);
+    expect(own.content[0].text).toContain("running");
 
     records.set("foreign", {
       id: "foreign",
@@ -290,39 +272,15 @@ describe("child-safe nested Agent tools", () => {
       parentAgentId: "other",
       session: { steer: vi.fn() },
     });
-    expect((await execute(getResult, { agent_id: "foreign" })).isError).toBe(true);
-    expect((await execute(steer, { agent_id: "foreign", message: "stop" })).isError).toBe(true);
-    expect((await execute(agent, {
+    await expect(execute(getResult, { agent_id: "foreign" })).rejects.toThrow("not found or not owned");
+    await expect(execute(steer, { agent_id: "foreign", message: "stop" })).rejects.toThrow("not found or not owned");
+    await expect(execute(agent, {
       resume: "foreign",
       subagent_type: "scout",
       description: "resume foreign",
       prompt: "Continue",
-    })).isError).toBe(true);
+    })).rejects.toThrow("not found or not owned");
     expect(manager.resume).not.toHaveBeenCalled();
-  });
-
-  it("keeps a failed accepted nested resume on the success channel with same-agent recovery", async () => {
-    const record = {
-      id: "child-1", status: "error", error: "provider exploded",
-      result: "got this far", parentAgentId: "parent-1", session: {} as any,
-    };
-    records.set(record.id, record);
-    manager.resume.mockResolvedValue(record);
-    const [agent] = tools();
-    const result = await execute(agent, {
-      subagent_type: "scout",
-      description: "resume child",
-      prompt: "Continue",
-      resume: record.id,
-    });
-
-    expect(result.isError).toBe(false);
-    expect(result.content[0].text).toContain("Agent outcome:");
-    expect(result.content[0].text).toContain("recovery: resume_same_agent");
-    expect(result.content[0].text).toContain("agent_id: child-1");
-    expect(result.details).toEqual(expect.objectContaining({
-      outcome: expect.objectContaining({ agentId: "child-1", recovery: "resume_same_agent" }),
-    }));
   });
 
   it("waits for a queued owned child to start and settle", async () => {
@@ -345,9 +303,7 @@ describe("child-safe nested Agent tools", () => {
 
     const result = await execute(getResult, { agent_id: record.id, wait: true });
 
-    expect(result.content[0].text).toContain("Agent outcome:");
-    expect(result.content[0].text).toContain("status: completed");
-    expect(result.content[0].text).toContain("queued done");
+    expect(result.content[0].text).toBe("queued done");
   });
 
   it("aborts a nested result wait without aborting the owned child", async () => {
@@ -385,14 +341,11 @@ describe("child-safe nested Agent tools", () => {
     setFallbackSubagent("scout");
     try {
       const [agent] = tools(["scout"]);
-      const result = await execute(agent, {
+      await expect(execute(agent, {
         subagent_type: "definitely-missing",
         description: "typo",
         prompt: "Do work",
-      });
-
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("Unknown or disabled nested agent type");
+      })).rejects.toThrow("Unknown or disabled nested agent type");
       expect(spawnAndWait).not.toHaveBeenCalled();
     } finally {
       setFallbackSubagent(undefined);
@@ -401,13 +354,12 @@ describe("child-safe nested Agent tools", () => {
 
   it("hands the branch cap down to the child it spawns", async () => {
     const [agent] = tools("all", 1, 3);
-    const result = await execute(agent, {
+    await execute(agent, {
       subagent_type: "scout",
       description: "child",
       prompt: "Do work",
     });
 
-    expect(result.isError).toBe(false);
     expect(spawnAndWait).toHaveBeenCalledWith(
       expect.anything(), expect.anything(), "scout", "Do work",
       expect.objectContaining({ depth: 2, maxSubagentDepth: 3 }),
@@ -427,7 +379,6 @@ describe("child-safe nested Agent tools", () => {
       prompt: "Do work",
     });
 
-    expect(result.isError).toBe(false);
     // Foreground: the whole output is inline and no id came back, so the note
     // must not invite a get_subagent_result call the parent cannot make (#174).
     expect(result.content[0].text).toContain("everything the agent produced is above");
@@ -448,12 +399,12 @@ describe("child-safe nested Agent tools", () => {
     expect(result.content[0].text).not.toContain("everything the agent produced is above");
   });
 
-  it("keeps a failed accepted child's lifecycle and partial output on the success channel", async () => {
+  it("keeps a failed child's partial output alongside the error", async () => {
     spawnAndWait.mockImplementation(async () => ({
       id: "child-1",
       record: {
         id: "child-1", status: "error", error: "provider exploded",
-        result: "got this far", parentAgentId: "parent-1", session: {} as any,
+        result: "got this far", parentAgentId: "parent-1",
       },
     }));
     const [agent] = tools();
@@ -463,36 +414,8 @@ describe("child-safe nested Agent tools", () => {
       prompt: "Do work",
     });
 
-    expect(result.isError).toBe(false);
-    expect(result.content[0].text).toContain("Agent outcome:");
-    expect(result.content[0].text).toContain("recovery: resume_same_agent");
-    expect(result.content[0].text).toContain("agent_id: child-1");
     expect(result.content[0].text).toContain("provider exploded");
     expect(result.content[0].text).toContain("got this far");
-    expect(result.details).toEqual(expect.objectContaining({
-      outcome: expect.objectContaining({
-        agentId: "child-1",
-        category: "provider",
-        recovery: "resume_same_agent",
-      }),
-    }));
-  });
-
-  it("keeps a fetched failed accepted child on the success channel with same-agent recovery", async () => {
-    records.set("child-1", {
-      id: "child-1", status: "error", error: "provider exploded",
-      result: "got this far", parentAgentId: "parent-1", session: {} as any,
-    });
-    const [, getResult] = tools();
-    const result = await execute(getResult, { agent_id: "child-1" });
-
-    expect(result.isError).toBe(false);
-    expect(result.content[0].text).toContain("Agent outcome:");
-    expect(result.content[0].text).toContain("recovery: resume_same_agent");
-    expect(result.content[0].text).toContain("agent_id: child-1");
-    expect(result.details).toEqual(expect.objectContaining({
-      outcome: expect.objectContaining({ agentId: "child-1", recovery: "resume_same_agent" }),
-    }));
   });
 
   it("attributes a nested child's token spend to the owning parent", async () => {
@@ -581,21 +504,5 @@ describe("child-safe nested Agent tools", () => {
     } as any, undefined, undefined, executionCtx);
 
     expect(spawnAndWait.mock.calls[0][1]).toBe(executionCtx);
-  });
-
-  it("nested Agent isolation schema documents worktree prerequisites without init-to-enable", () => {
-    // Public seam: inspect the real registered nested Agent parameters schema
-    // (same surface models see), not a duplicated description constant.
-    const [agent] = tools();
-    const schemaText = JSON.stringify(agent.parameters);
-    const lower = schemaText.toLowerCase();
-
-    expect(schemaText).toContain('"worktree"');
-    expect(lower).toMatch(/valid head|at least one commit/);
-    expect(lower).toMatch(/omit.*isolation|without isolation|non-git/);
-    expect(lower).toContain("parent session cwd");
-    expect(lower).toMatch(/path.*prompt.*cannot|cannot.*path.*prompt/);
-    expect(lower).toMatch(/never initialize|do not initialize|never init/);
-    expect(schemaText).not.toMatch(/Initialize git and commit at least once/);
   });
 });

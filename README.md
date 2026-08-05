@@ -11,7 +11,6 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 ## Features
 
 - **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native
-- **Explicit lifecycle contract** — rejected invocations (invalid models/options/IDs or foreground pre-session startup failure) are Pi tool errors and create no recoverable agent. Once a run is accepted, provider/runtime failures, turn-limit endings, and stops remain successful tool responses with a stable `Agent outcome:` block (`status`, `category`, `agent_id`, and recovery policy). `resume_same_agent` is advertised only for runs that have a session; stopped no-session runs forbid a fresh spawn without inventing recovery, while delayed/background pre-session startup failures retain their accepted ID and allow a fresh start only after correcting the startup problem.
 - **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 4) and smart group join (consolidated notifications)
 - **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
 - **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
@@ -90,6 +89,7 @@ Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`.
 Restrictions:
 - `schedule` cannot be combined with `inherit_context` (no parent conversation exists at fire time) or `resume` (schedules create fresh agents).
 - `run_in_background` is forced to `true`.
+- An explicit or frontmatter `model` is persisted and re-resolved when the job fires. If it is invalid at creation or unavailable at fire time, the job fails closed instead of inheriting another model.
 - Scheduled fires bypass the `maxConcurrent` queue so a 5-minute interval cannot be deferred behind long-running manual agents.
 - **Headless `pi -p` doesn't wait for scheduled subagents.**
 
@@ -217,9 +217,8 @@ All fields are optional — sensible defaults for everything.
 | `skills` | `true` | Inherit skills from parent. Can be a comma-separated list of skill names to preload (see [Skill Preloading](#skill-preloading) for discovery locations) |
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
-| `isolation` | — | `worktree` runs in an isolated git worktree; `off` explicitly disables worktree isolation |
-| `model` | inherit parent | Primary model — `provider/modelId` or an unambiguous fuzzy name (`"haiku"`, `"sonnet"`). Provider-qualified names stay within that provider; bare names must have one best match across providers. |
-| `fallback_models` | `subagents.json` `defaultFallbackModels` | Ordered comma-separated or YAML-list backup models. A list replaces the global/project default; `false` explicitly disables inherited defaults. No camelCase frontmatter alias or other disable spelling is accepted. |
+| `isolation` | — | Set to `worktree` to run in an isolated git worktree |
+| `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
 | `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
 | `persist_session` | `false` | Persist this subagent as a normal pi session instead of keeping the session in memory only. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
@@ -232,9 +231,9 @@ All fields are optional — sensible defaults for everything.
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
-Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, or `isolated`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified. `isolation` is the exception: an explicit `isolation: "off"` tool argument can disable an agent's `worktree` default.
+Frontmatter is authoritative for `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, and `isolation`; `Agent` parameters fill only fields the config leaves unspecified. `model` is the deliberate exception: a nonblank function-call value overrides frontmatter, while blank or whitespace means omitted. A resume uses only `resume` and `prompt`; spawn-only fields are ignored.
 
-**Forgiving `model:` resolution.** A `model:` pin is matched against pi's model registry tolerantly, so cosmetic id variations don't silently drop the agent back to the parent's model: `.` and `-` are treated as equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa), and a `provider/modelId` whose named provider doesn't carry that model retries the bare id against every provider. Precedence is **exact → fuzzy under the named provider → same model under any provider → unavailable**, so an exact match always wins and dated snapshots aren't conflated. If nothing resolves, the pin can't run and the agent inherits the parent model — `/agents → Agent types` flags this case as `(unavailable, fallback: inherit)` and shows the resolved target `(→ provider/id)` when resolution lands on a different provider or version than configured. (This is distinct from [Model Scope](#model-scope) enforcement, which matches the `enabledModels` allowlist by *exact* entry.)
+**Forgiving `model:` resolution.** A model selector is matched against pi's model registry tolerantly: `.` and `-` are treated as equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa), and a `provider/modelId` whose named provider doesn't carry that model retries the bare id against every provider. Precedence is **exact → fuzzy under the named provider → same model under any provider → unavailable**. Equal-best fuzzy matches are rejected as ambiguous instead of selecting registry order. For immediate spawns, an unavailable frontmatter pin retains the existing parent-model fallback; explicit call overrides and scheduled model selectors fail closed. `/agents → Agent types` flags an unavailable frontmatter pin and shows the resolved target `(→ provider/id)` when resolution lands on a different provider or version than configured. (This is distinct from [Model Scope](#model-scope) enforcement, which matches the `enabledModels` allowlist by *exact* entry.)
 
 ### Nested subagents
 
@@ -309,10 +308,10 @@ Launch a sub-agent.
 | `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
-| `isolation` | `"worktree"` \| `"off"` | no | Use an isolated Git worktree, or explicitly disable worktree isolation (overrides an agent's `worktree` default) |
 | `run_in_background` | boolean | no | Run without blocking |
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
+| `isolation` | `"worktree"` | no | Run in an isolated git worktree |
 | `inherit_context` | boolean | no | Fork parent conversation into agent |
 
 ### `get_subagent_result`
@@ -398,36 +397,6 @@ When background agents complete, they notify the main agent. The **join mode** c
 **Configuration:**
 - Configure join mode in `/agents` → Settings → Join mode
 
-## Fallback Models
-
-`fallback_models` is a model chain, independent of `fallbackSubagent` (which substitutes an **agent type** when `subagent_type` does not resolve):
-
-```yaml
----
-model: anthropic/claude-haiku-4-5
-fallback_models:
-  - openai/gpt-4o-mini
-  - google/gemini-2.5-flash
----
-```
-
-Set defaults globally in `~/.pi/agent/subagents.json` or per project in `<cwd>/.pi/subagents.json`; project settings replace the global field:
-
-```json
-{
-  "defaultFallbackModels": [
-    "openai/gpt-4o-mini",
-    "google/gemini-2.5-flash"
-  ]
-}
-```
-
-Precedence is `fallback_models: false` (disable) → agent list (replace) → `defaultFallbackModels` (inherit). An explicit `Agent({ model: "..." })` suppresses cross-model fallback, but Pi's normal same-model automatic retries still run. Otherwise Pi exhausts same-model retries first, then advances on a final provider/model assistant error. Context overflow stays with Pi compaction; tool errors, aborts, stops, max-turn outcomes, and ordinary task failure never advance the chain.
-
-Fallback stays in one child session: the failed branch remains in its append-only session/transcript for diagnosis, while the active context returns to the invocation prompt before switching model. Only the successful model's final answer is returned. All candidates unavailable/failed produces a bounded `Model attempts` error and never silently inherits an unlisted model. Retrying a whole invocation may repeat tool side effects; active nested children from the failed attempt are stopped before the next model begins.
-
-Automatic switching uses a private in-memory clone of Pi settings, so it does not change Pi's global/project default model. Requires Pi 0.80.5 or later.
-
 ## Model Scope
 
 **Opt-in:** off by default. Enable via `/agents → Settings → Scope models`.
@@ -439,7 +408,7 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 | Model source | Out-of-scope behavior |
 |---|---|
 | Caller-supplied via `Agent({ model: "..." })` | Hard error returned to the orchestrator, listing allowed models |
-| Pinned in agent frontmatter or fallback chain | Warning toast + the configured model runs (frontmatter/settings are authoritative) |
+| Pinned in agent frontmatter | Warning toast + the pinned model runs (frontmatter is authoritative) |
 | Parent-inherited (neither set) | Warning toast + parent's model runs |
 
 **Design:** `scopeModels` is a guardrail against the orchestrator picking unexpected models at runtime, not a hard policy against user-level config. The "frontmatter is authoritative" guarantee from v0.5.1 still holds for `model:` — caller params can't override frontmatter, and frontmatter pins run even when out of scope (with a visible warning).
@@ -567,11 +536,11 @@ pi.events.emit("subagents:rpc:spawn", {
   requestId,
   type: "general-purpose",
   prompt: "Do something useful",
-  options: { description: "My task", run_in_background: true },
+  options: { description: "My task", isBackground: true },
 });
 ```
 
-`options.model` accepts either a `Model` object (e.g. `ctx.model`) or a `"provider/modelId"` string — strings are resolved against `ctx.modelRegistry` at the RPC boundary, so cross-extension callers can forward serializable values without losing auth context.
+RPC protocol v3 accepts only the public spawn options `description`, `model`, `maxTurns`, `isolated`, `inheritContext`, `thinkingLevel`, `isBackground`, `isolation`, and `cwd`; unknown/internal manager options are rejected. `options.model` accepts either a `Model` object (e.g. `ctx.model`) or a `"provider/modelId"` string — strings are resolved against `ctx.modelRegistry` at the RPC boundary, so cross-extension callers can forward serializable values without losing auth context.
 
 `options.cwd` (absolute path to an existing directory — anything else returns an error envelope; `null` means unset) runs the agent in a different working directory than the parent session. Its tools operate there and the prompt's environment block describes it, but **`.pi` config still loads from the parent session's project** — the target directory's `.pi` extensions never execute, and its agents/skills/settings are not picked up. Combined with `isolation: "worktree"`, the worktree is created *from* the target directory's repo, the agent works at the equivalent subdirectory inside the copy (a monorepo-package cwd stays scoped to that package), and the resulting `pi-agent-*` branch lands in that repo — the completion message names it. On session end, worktree registrations are pruned in every repo that received one; only a hard crash can leave a stale entry (then: `git worktree prune` in the target repo). Agents with `memory:` keep reading/writing the parent project's memory.
 
@@ -627,7 +596,7 @@ The agent gets a full, isolated copy of the repository. On completion:
 
 The automatic preservation commit uses `--no-verify`, so local pre-commit hooks can't block it — the commit is local-only and never pushed, and pre-push/server-side hooks still apply.
 
-If the worktree cannot be created (not a git repo, no commits, or `git worktree add` fails), the `Agent` tool returns a clear error instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. Omit `isolation` when an unisolated run is appropriate; never initialize or commit a repository solely to enable worktree isolation.
+If the worktree cannot be created (not a git repo, no commits, or `git worktree add` fails), the `Agent` tool returns a clear error instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. Initialize git and commit at least once, or omit `isolation`.
 
 ## Skill Preloading
 

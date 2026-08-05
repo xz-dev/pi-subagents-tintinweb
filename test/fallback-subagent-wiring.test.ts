@@ -116,7 +116,6 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
         },
         undefined, undefined, ctx(),
       )).rejects.toThrow('Unknown or disabled agent type: "definitely-missing"');
-
       // The whole point: nothing ran.
       expect(runAgent).not.toHaveBeenCalled();
     });
@@ -175,7 +174,6 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
       { prompt: "do it", description: "disabled dispatch", subagent_type: "retired" },
       undefined, undefined, ctx(),
     )).rejects.toThrow("Unknown or disabled agent type");
-
     expect(runAgent).not.toHaveBeenCalled();
   });
 
@@ -205,9 +203,16 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
     // unused. Gating it would make a live agent unresumable the moment its type
     // is deleted or disabled — the opposite of what strict dispatch is for.
     const { tools } = boot();
-    vi.mocked(runAgent).mockResolvedValue({
-      responseText: "first", session: { dispose: vi.fn() } as any, aborted: false, steered: false,
-    });
+    const session = {
+      dispose: vi.fn(),
+      messages: [],
+      subscribe: vi.fn(() => vi.fn()),
+      prompt: vi.fn(),
+      state: { messages: [] },
+    } as any;
+    vi.mocked(runAgent)
+      .mockResolvedValueOnce({ responseText: "first", session, aborted: false, steered: false })
+      .mockResolvedValueOnce({ responseText: "continued", session, aborted: false, steered: false });
     const spawned = await tools.get("Agent").execute(
       "tc-6",
       { prompt: "start", description: "live agent", subagent_type: "scout" },

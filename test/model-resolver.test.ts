@@ -7,7 +7,6 @@ const MODELS = [
   { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic" },
   { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
   { id: "gpt-4o", name: "GPT-4o", provider: "openai" },
-  { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "gateway" },
   { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "google" },
 ];
 
@@ -35,28 +34,17 @@ describe("resolveModel", () => {
       expect(result).toEqual(MODELS[3]);
     });
 
-    it("does not cross providers when an explicit provider/model is unavailable", () => {
-      const result = resolveModel("anthropic/not-present", makeRegistry());
-      expect(result).toContain('Model not found: "anthropic/not-present"');
-    });
-
-    it("allows fuzzy matching only within an explicit provider", () => {
+    it("falls through to fuzzy when exact provider/modelId not found", () => {
+      // "anthropic/haiku" is not an exact match, but fuzzy should find it
       const result = resolveModel("anthropic/haiku", makeRegistry());
-      expect(result).toEqual(MODELS[2]);
+      expect(result).toEqual(MODELS[2]); // haiku
     });
   });
 
   describe("fuzzy match — exact id", () => {
-    it("matches an exact bare model id when it is unique across providers", () => {
+    it("matches exact model id without provider", () => {
       const result = resolveModel("claude-opus-4-6", makeRegistry());
       expect(result).toEqual(MODELS[0]);
-    });
-
-    it("rejects a bare model id that matches multiple providers", () => {
-      const result = resolveModel("claude-haiku-4-5-20251001", makeRegistry());
-      expect(result).toContain("ambiguous");
-      expect(result).toContain("anthropic/claude-haiku-4-5-20251001");
-      expect(result).toContain("gateway/claude-haiku-4-5-20251001");
     });
 
     it("is case-insensitive", () => {
@@ -71,9 +59,9 @@ describe("resolveModel", () => {
   });
 
   describe("fuzzy match — substring", () => {
-    it("rejects a fuzzy match that spans multiple providers", () => {
+    it("matches 'haiku' to claude-haiku model", () => {
       const result = resolveModel("haiku", makeRegistry());
-      expect(result).toContain("ambiguous");
+      expect(result).toEqual(MODELS[2]);
     });
 
     it("matches 'sonnet' to claude-sonnet model", () => {
@@ -88,12 +76,12 @@ describe("resolveModel", () => {
 
     it("matches 'gemini' to gemini model", () => {
       const result = resolveModel("gemini", makeRegistry());
-      expect(result).toEqual(MODELS[5]);
+      expect(result).toEqual(MODELS[4]);
     });
 
-    it("is case-insensitive for ambiguous substrings", () => {
+    it("is case-insensitive for substring", () => {
       const result = resolveModel("HAIKU", makeRegistry());
-      expect(result).toContain("ambiguous");
+      expect(result).toEqual(MODELS[2]);
     });
   });
 
@@ -113,7 +101,7 @@ describe("resolveModel", () => {
     });
 
     it("matches a dashed query to a dotted id", () => {
-      expect(resolveModel("gemini-2-5-pro", makeRegistry())).toEqual(MODELS[5]);
+      expect(resolveModel("gemini-2-5-pro", makeRegistry())).toEqual(MODELS[4]);
     });
   });
 
@@ -137,13 +125,12 @@ describe("resolveModel", () => {
     });
   });
 
-  describe("provider-qualified inputs", () => {
+  describe("provider fallback (prefer named provider, else any)", () => {
     const gatewayHaiku = { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "openrouter" };
     const anthropicHaiku = { id: "claude-haiku-4-5", name: "Claude Haiku", provider: "anthropic" };
 
-    it("does not fall back to another provider when the named one lacks the model", () => {
-      expect(resolveModel("anthropic/claude-haiku-4-5", makeRegistry([gatewayHaiku])))
-        .toContain('Model not found: "anthropic/claude-haiku-4-5"');
+    it("falls back to another provider when the named one lacks the model", () => {
+      expect(resolveModel("anthropic/claude-haiku-4-5", makeRegistry([gatewayHaiku]))).toEqual(gatewayHaiku);
     });
 
     it("prefers the named provider when it has the model", () => {
@@ -161,9 +148,9 @@ describe("resolveModel", () => {
       expect(result).toEqual(MODELS[0]);
     });
 
-    it("rejects 'Haiku 4.5' when names collide across providers", () => {
+    it("matches 'Haiku 4.5' via model name", () => {
       const result = resolveModel("Haiku 4.5", makeRegistry());
-      expect(result).toContain("ambiguous");
+      expect(result).toEqual(MODELS[2]);
     });
   });
 
@@ -175,7 +162,7 @@ describe("resolveModel", () => {
 
     it("matches 'google pro' across provider and id", () => {
       const result = resolveModel("google pro", makeRegistry());
-      expect(result).toEqual(MODELS[5]);
+      expect(result).toEqual(MODELS[4]);
     });
   });
 
@@ -207,7 +194,7 @@ describe("resolveModel", () => {
       expect(result).toContain("openai/gpt-4o");
     });
 
-    it("empty string does not resolve", () => {
+    it("rejects an empty model name", () => {
       const result = resolveModel("", makeRegistry());
       expect(result).toContain('Model not found: ""');
     });
@@ -257,6 +244,16 @@ describe("resolveModel", () => {
     it("'4-6' picks the 4.6 model", () => {
       const result = resolveModel("4-6", makeRegistry(SIMILAR_MODELS));
       expect(result).toEqual(SIMILAR_MODELS[0]);
+    });
+
+    it("rejects equal-best fuzzy matches within one provider", () => {
+      const sameProvider = [
+        { id: "model-alpha", name: "Shared Model", provider: "gateway" },
+        { id: "model-beta", name: "Shared Model", provider: "gateway" },
+      ];
+
+      expect(resolveModel("Shared Model", makeRegistry(sameProvider)))
+        .toBe('Model "Shared Model" is ambiguous: gateway/model-alpha, gateway/model-beta. Use an explicit provider/model.');
     });
   });
 

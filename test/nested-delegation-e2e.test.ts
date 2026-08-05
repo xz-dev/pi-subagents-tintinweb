@@ -223,15 +223,6 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
         beforeRun: () => { registerAgents(loadCustomAgents(cwd)); },
       });
 
-      // The background child ran and its output came back through the id the
-      // spawn handed out — so it was never queued behind its waiting parent.
-      const orchestratorResult = run.parentSession.messages
-        .filter((m) => m.role === "toolResult")
-        .flatMap((m) => (m.content as Array<{ text?: string }>).map((b) => b.text ?? ""))
-        .join("\n");
-      expect(orchestratorResult).toContain("orchestrator polled");
-      expect(orchestratorResult).toContain(WORKER_MARKER);
-
       // Only the REAL manager wires onSessionCreated → streamToOutputFile for a
       // nested spawn, and only real rootSessionId propagation puts the file under
       // this root. Identify the WORKER's own transcript by the prompt in its
@@ -248,8 +239,6 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
         return first.message?.content === "Do the leaf work.";
       });
       expect(workerTranscript).toBeDefined();
-      // ...and it streamed the child's own turn, not just the seeded prompt.
-      expect(workerTranscript).toContain(WORKER_MARKER);
     } finally {
       rmSync(transcriptRoot, { recursive: true, force: true });
     }

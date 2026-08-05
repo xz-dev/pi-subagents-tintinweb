@@ -1,10 +1,4 @@
-import type {
-  AgentConfig,
-  IsolationMode,
-  IsolationPreference,
-  JoinMode,
-  ThinkingLevel,
-} from "./types.js";
+import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
 
 interface AgentInvocationParams {
   model?: string;
@@ -13,7 +7,7 @@ interface AgentInvocationParams {
   run_in_background?: boolean;
   inherit_context?: boolean;
   isolated?: boolean;
-  isolation?: IsolationPreference;
+  isolation?: IsolationMode;
 }
 
 export function resolveAgentInvocationConfig(
@@ -22,7 +16,6 @@ export function resolveAgentInvocationConfig(
 ): {
   modelInput?: string;
   modelFromParams: boolean;
-  fallbackModels?: string[] | false;
   thinking?: ThinkingLevel;
   maxTurns?: number;
   inheritContext: boolean;
@@ -30,20 +23,16 @@ export function resolveAgentInvocationConfig(
   isolated: boolean;
   isolation?: IsolationMode;
 } {
+  const requestedModel = params.model?.trim() || undefined;
   return {
-    modelInput: agentConfig?.model ?? params.model,
-    modelFromParams: agentConfig?.model == null && params.model != null,
-    fallbackModels: agentConfig?.fallbackModels,
+    modelInput: requestedModel ?? agentConfig?.model,
+    modelFromParams: requestedModel !== undefined,
     thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,
-    isolation: params.isolation === "off"
-      ? undefined
-      : (agentConfig?.isolation ?? params.isolation) === "worktree"
-        ? "worktree"
-        : undefined,
+    isolation: agentConfig?.isolation ?? params.isolation,
   };
 }
 

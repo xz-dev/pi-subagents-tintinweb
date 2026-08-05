@@ -32,10 +32,14 @@ function makeMockPi() {
   } as any;
 }
 
-function makeMockCtx() {
+function makeMockCtx(models: Array<{ id: string; name: string; provider: string }> = []) {
   return {
     cwd: "/tmp",
-    modelRegistry: { find: vi.fn(), getAll: () => [], getAvailable: () => [] },
+    modelRegistry: {
+      find: (provider: string, id: string) => models.find(model => model.provider === provider && model.id === id),
+      getAll: () => models,
+      getAvailable: () => models,
+    },
     sessionManager: { getSessionId: () => "sess-1" },
   } as any;
 }
@@ -132,6 +136,18 @@ describe("SubagentScheduler — lifecycle", () => {
     expect(job.scheduleType).toBe("interval");
     expect(scheduler.list()).toHaveLength(1);
     expect(pi.events.emit).toHaveBeenCalledWith("subagents:scheduled", expect.objectContaining({ type: "added" }));
+  });
+
+  it("rejects an unavailable model before persisting or arming a job", () => {
+    expect(() => scheduler.addJob({
+      name: "bad-model",
+      description: "test",
+      schedule: "1h",
+      subagent_type: "general-purpose",
+      prompt: "hi",
+      model: "missing/model",
+    })).toThrow('Model not found: "missing/model"');
+    expect(scheduler.list()).toEqual([]);
   });
 
   it("addJob rejects duplicate names", () => {
@@ -267,6 +283,34 @@ describe("SubagentScheduler — fire path", () => {
     expect(manager.spawn).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(20_000);
     expect(manager.spawn).toHaveBeenCalledTimes(3);
+  });
+
+  it("fails closed when a stored model becomes unavailable before fire", () => {
+    const model = { id: "scheduled", name: "Scheduled", provider: "test" };
+    const available = [model];
+    ctx.modelRegistry = {
+      find: (provider: string, id: string) => available.find(m => m.provider === provider && m.id === id),
+      getAll: () => available,
+      getAvailable: () => available,
+    };
+    const job = scheduler.addJob({
+      name: "model-gone",
+      description: "unavailable model",
+      schedule: "+1s",
+      subagent_type: "general-purpose",
+      prompt: "run",
+      model: "test/scheduled",
+    });
+    available.splice(0);
+
+    vi.advanceTimersByTime(2_000);
+
+    expect(manager.spawn).not.toHaveBeenCalled();
+    expect(store.get(job.id)?.lastStatus).toBe("error");
+    expect(pi.events.emit).toHaveBeenCalledWith(
+      "subagents:scheduled",
+      expect.objectContaining({ type: "error", error: expect.stringContaining("not found") }),
+    );
   });
 
   it("refuses at fire time when the job's agent type no longer resolves", () => {
