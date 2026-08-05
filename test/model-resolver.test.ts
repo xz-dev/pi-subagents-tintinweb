@@ -194,11 +194,9 @@ describe("resolveModel", () => {
       expect(result).toContain("openai/gpt-4o");
     });
 
-    it("empty string matches a model (multi-part vacuous truth)", () => {
-      // Empty string splits to empty parts; every() on empty array is true
-      // This is fine — callers guard against empty input
+    it("rejects an empty model name", () => {
       const result = resolveModel("", makeRegistry());
-      expect(typeof result).toBe("object");
+      expect(result).toContain('Model not found: ""');
     });
   });
 
@@ -246,6 +244,16 @@ describe("resolveModel", () => {
     it("'4-6' picks the 4.6 model", () => {
       const result = resolveModel("4-6", makeRegistry(SIMILAR_MODELS));
       expect(result).toEqual(SIMILAR_MODELS[0]);
+    });
+
+    it("rejects equal-best fuzzy matches within one provider", () => {
+      const sameProvider = [
+        { id: "model-alpha", name: "Shared Model", provider: "gateway" },
+        { id: "model-beta", name: "Shared Model", provider: "gateway" },
+      ];
+
+      expect(resolveModel("Shared Model", makeRegistry(sameProvider)))
+        .toBe('Model "Shared Model" is ambiguous: gateway/model-alpha, gateway/model-beta. Use an explicit provider/model.');
     });
   });
 

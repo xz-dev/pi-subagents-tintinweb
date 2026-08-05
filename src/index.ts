@@ -12,6 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
@@ -32,7 +33,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentRecord, type IsolationMode, type JoinMode, type NotificationDetails, type SubagentType, type ThinkingLevel, type WidgetMode } from "./types.js";
 import {
   type AgentActivity,
   type AgentDetails,
@@ -800,9 +801,10 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
-- Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
+- Nonblank model overrides agent frontmatter; other configured frontmatter fields take precedence over call values.
+- Parallel work: one message, multiple Agent calls, run_in_background: true on each. Background completion is delivered automatically — never poll or sleep.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.
+- resume continues the exact prior session using only prompt + resume; steer_subagent messages a running one.
 - isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
@@ -824,15 +826,15 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - When you launch multiple agents for independent work, send them in a single message with multiple tool uses, with run_in_background: true on each, so they run concurrently. If the user specifies that they want agents run "in parallel", you MUST send a single message with multiple tool calls. Foreground calls run sequentially — only one executes at a time.
 - When the agent is done, it returns a single message back to you. The result is not visible to the user — to show the user, send a text message with a concise summary.
 - Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
-- Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
+- Use run_in_background for work you don't need immediately. Completion is delivered automatically — do NOT poll or sleep. Continue with other work or respond to the user instead.
 - Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
-- Use thinking to control extended thinking level.
-- Use inherit_context if the agent needs the parent conversation history.
+- Use a nonblank model to override the selected agent's frontmatter model (as "provider/modelId", or an unambiguous fuzzy name). Blank means omitted.
+- Agent frontmatter takes precedence for thinking, max_turns, run_in_background, inherit_context, and isolated; call values fill only fields frontmatter leaves unspecified.
+- With resume, only prompt and resume are used. Omit spawn-only fields; use steer_subagent to redirect a running agent.
 - Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications). The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.${scheduleGuideline}
 
 ## Writing the prompt
@@ -903,63 +905,41 @@ Terse command-style prompts produce shallow, generic work.
     promptGuidelines: [
       "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
       "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
-      "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead.",
+      "When Agent runs in background, completion is delivered automatically — do not poll or sleep. Continue other work; use get_subagent_result only when blocking is required.",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
     ],
     parameters: Type.Object({
-      prompt: Type.String({
-        description: "The task for the agent to perform.",
-      }),
-      description: Type.String({
-        description: "A short (3-5 word) description of the task (shown in UI).",
-      }),
-      subagent_type: Type.String({
-        description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
-      }),
-      model: Type.Optional(
-        Type.String({
-          description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
-        }),
-      ),
-      thinking: Type.Optional(
-        Type.String({
-          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
-        }),
-      ),
-      max_turns: Type.Optional(
-        Type.Number({
-          description: "Maximum number of agentic turns before stopping. Omit for unlimited (default).",
-          minimum: 1,
-        }),
-      ),
-      run_in_background: Type.Optional(
-        Type.Boolean({
-          description: "Set to true to run in background. Returns agent ID immediately. You will be notified on completion.",
-        }),
-      ),
-      resume: Type.Optional(
-        Type.String({
-          description: "Optional agent ID to resume from. Continues from previous context.",
-        }),
-      ),
-      isolated: Type.Optional(
-        Type.Boolean({
-          description: "If true, agent gets no extension/MCP tools — only built-in tools.",
-        }),
-      ),
-      inherit_context: Type.Optional(
-        Type.Boolean({
-          description: "If true, fork parent conversation into the agent. Default: false (fresh context).",
-        }),
-      ),
-      isolation: Type.Optional(
-        Type.Literal("worktree", {
-          description: 'Set to "worktree" to run the agent in a temporary git worktree (isolated copy of the repo). Changes are saved to a branch on completion.',
-        }),
-      ),
+      prompt: Type.String({ minLength: 1, description: "Self-contained task or continuation prompt." }),
+      description: Type.String({ minLength: 1, description: "Short task summary for a new spawn; ignored on resume." }),
+      subagent_type: Type.String({ minLength: 1, description: `Agent type for a new spawn; ignored on resume. Available: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.` }),
+      model: Type.Optional(Type.String({
+        description: 'Nonblank model override for a new spawn. Accepts "provider/modelId" or an unambiguous fuzzy name and overrides agent frontmatter. Blank means omitted; ignored on resume.',
+      })),
+      thinking: Type.Optional(Type.Unsafe<ThinkingLevel>(StringEnum(THINKING_LEVELS, {
+        description: "Requested thinking level when agent frontmatter does not define one; ignored on resume.",
+      }))),
+      max_turns: Type.Optional(Type.Integer({
+        description: "Maximum turns when agent frontmatter does not define one. Omit for the configured default; ignored on resume.",
+        minimum: 1,
+      })),
+      run_in_background: Type.Optional(Type.Boolean({
+        description: "Run a new agent in background. Agent frontmatter takes precedence. Completion is delivered automatically; ignored on resume.",
+      })),
+      resume: Type.Optional(Type.String({
+        minLength: 1,
+        description: "Existing agent ID to continue. Only prompt and resume are used; omit model, thinking, max_turns, run_in_background, inherit_context, isolated, isolation, and schedule.",
+      })),
+      isolated: Type.Optional(Type.Boolean({
+        description: "Disable extension/MCP tools when agent frontmatter does not define isolated; ignored on resume.",
+      })),
+      inherit_context: Type.Optional(Type.Boolean({
+        description: "Fork parent context when agent frontmatter does not define inheritance. Default false; ignored on resume.",
+      })),
+      isolation: Type.Optional(Type.Unsafe<IsolationMode>(StringEnum(["worktree"] as const, {
+        description: 'Run a new agent in a temporary Git worktree; ignored on resume.',
+      }))),
       ...scheduleParam,
-    }),
+    }, { additionalProperties: false }),
 
     // ---- Custom rendering: Claude Code style ----
 
@@ -1065,12 +1045,30 @@ Terse command-style prompts produce shallow, generic work.
       // the caller is still unaware. `fallbackSubagent` decides whether an
       // unresolvable type falls back or fails closed.
       const dispatch = resolveSpawnType(rawType);
-      // `resume` replays a stored session and ignores `subagent_type` entirely,
-      // but the parameter is required by the schema — so gating it here would
-      // make a live agent unresumable the moment its type is deleted, disabled,
-      // or gains a case-clashing sibling. Only a real spawn is gated.
-      if (!dispatch.ok && !params.resume) return textResult(dispatch.message);
-      const subagentType = dispatch.ok ? dispatch.type : rawType;
+      // Resume replays the exact stored session. Return before validating any
+      // spawn-only field: a stale/invalid type or model must not strand it.
+      if (params.resume) {
+        const existing = manager.getRecord(params.resume);
+        if (!existing || existing.parentAgentId) {
+          throw new Error(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+        }
+        if (!existing.session) {
+          throw new Error(`Agent "${params.resume}" has no active session to resume.`);
+        }
+        const record = await manager.resume(params.resume, params.prompt, signal);
+        if (!record) throw new Error(`Failed to resume agent "${params.resume}".`);
+        if (record.status === "error") {
+          throw new Error(`Agent failed: ${record.error}${partialOutputSuffix(record)}`);
+        }
+        return textResult(record.result?.trim() || "No output.", buildDetails({
+          displayName: getDisplayName(record.type),
+          description: record.description,
+          subagentType: record.type,
+        }, record));
+      }
+
+      if (!dispatch.ok) throw new Error(dispatch.message);
+      const subagentType = dispatch.type;
       // What the caller actually asked for, named once: `fellBackFrom` is "" for
       // a blank request, so reading it inline invites the `??`-vs-`||` slip that
       // once persisted an empty type into a scheduled job.
@@ -1089,15 +1087,19 @@ Terse command-style prompts produce shallow, generic work.
       // Get agent config (if any)
       const customConfig = getAgentConfig(subagentType);
 
-      const resolvedConfig = resolveAgentInvocationConfig(customConfig, params);
+      const resolvedConfig = resolveAgentInvocationConfig(customConfig, {
+        ...params,
+        thinking: params.thinking as string | undefined,
+        isolation: params.isolation as IsolationMode | undefined,
+      });
 
       // Resolve model from agent config first; tool-call params only fill gaps.
       let model = ctx.model;
       if (resolvedConfig.modelInput) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
-          if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
+          if (resolvedConfig.modelFromParams || params.schedule) throw new Error(resolved);
+          // Configured immediate spawns preserve the existing parent fallback.
         } else {
           model = resolved;
         }
@@ -1114,7 +1116,7 @@ Terse command-style prompts produce shallow, generic work.
         agentLabel: customConfig?.displayName ?? subagentType,
         modelInput: resolvedConfig.modelInput,
       });
-      if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
+      if (scopeVerdict.kind === "error") throw new Error(scopeVerdict.message);
       if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
 
       const thinking = resolvedConfig.thinking;
@@ -1166,19 +1168,19 @@ Terse command-style prompts produce shallow, generic work.
       // ---- Schedule: register a job, don't spawn now ----
       if (params.schedule) {
         if (!isSchedulingEnabled()) {
-          return textResult("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
+          throw new Error("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
         }
         if (params.resume) {
-          return textResult("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
+          throw new Error("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
         }
         if (params.inherit_context) {
-          return textResult("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
+          throw new Error("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
         }
         if (params.run_in_background === false) {
-          return textResult("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
+          throw new Error("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
         }
         if (!scheduler.isActive()) {
-          return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
+          throw new Error("Scheduler is not active in this session yet. Try again after the session has fully started.");
         }
         try {
           const job = scheduler.addJob({
@@ -1189,7 +1191,7 @@ Terse command-style prompts produce shallow, generic work.
             // at fire time, and the original is what a user edits.
             subagent_type: requestedType,
             prompt: params.prompt as string,
-            model: params.model as string | undefined,
+            model: resolvedConfig.modelInput,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
             isolated: isolated,
@@ -1202,32 +1204,8 @@ Terse command-style prompts produce shallow, generic work.
             `Manage via /agents → Scheduled jobs.`,
           );
         } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err));
+          throw err instanceof Error ? err : new Error(String(err));
         }
-      }
-
-      // Resume existing agent
-      if (params.resume) {
-        const existing = manager.getRecord(params.resume);
-        if (!existing || existing.parentAgentId) {
-          return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
-        }
-        if (!existing.session) {
-          return textResult(`Agent "${params.resume}" has no active session to resume.`);
-        }
-        const record = await manager.resume(params.resume, params.prompt, signal);
-        if (!record) {
-          return textResult(`Failed to resume agent "${params.resume}".`);
-        }
-        // A failed resume surfaces the error, plus any partial output THIS
-        // resume produced (never the previous turn's answer, #144).
-        if (record.status === "error") {
-          return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBase, record));
-        }
-        return textResult(
-          record.result?.trim() || "No output.",
-          buildDetails(detailBase, record),
-        );
       }
 
       // Background execution
@@ -1262,7 +1240,7 @@ Terse command-style prompts produce shallow, generic work.
             ...bgCallbacks,
           });
         } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err));
+          throw err instanceof Error ? err : new Error(String(err));
         }
 
         // Set output file + join mode synchronously after spawn, before the
@@ -1308,8 +1286,8 @@ Terse command-style prompts produce shallow, generic work.
           `Description: ${params.description}\n` +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-          `\nYou will be notified when this agent completes.\n` +
-          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
+          `\nCompletion is delivered automatically. Continue independent work instead of polling.\n` +
+          `Use get_subagent_result only when blocking is required, or steer_subagent to redirect the running agent.\n` +
           `Do not duplicate this agent's work.`,
           { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
         );
@@ -1396,7 +1374,7 @@ Terse command-style prompts produce shallow, generic work.
         record = fgResult.record;
       } catch (err) {
         clearInterval(spinnerInterval);
-        return textResult(err instanceof Error ? err.message : String(err));
+        throw err instanceof Error ? err : new Error(String(err));
       }
 
       clearInterval(spinnerInterval);
@@ -1439,23 +1417,24 @@ Terse command-style prompts produce shallow, generic work.
     promptSnippet: "Check status and retrieve results from a background agent",
     parameters: Type.Object({
       agent_id: Type.String({
-        description: "The agent ID to check.",
+        minLength: 1,
+        description: "Background agent ID returned by Agent.",
       }),
       wait: Type.Optional(
         Type.Boolean({
-          description: "If true, wait for the agent to complete before returning. Default: false.",
+          description: "Wait abortably for completion. Default false; cancelling this wait does not stop the agent. Prefer automatic completion delivery unless blocking is required.",
         }),
       ),
       verbose: Type.Optional(
         Type.Boolean({
-          description: "If true, include the agent's full conversation (messages + tool calls). Default: false.",
+          description: "Include the full conversation (messages + tool calls), which may be large. Default false.",
         }),
       ),
-    }),
+    }, { additionalProperties: false }),
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
       const record = manager.getRecord(params.agent_id);
       if (!record || record.parentAgentId) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+        throw new Error(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
 
       // Wait for completion if requested. Cancellation stops only this tool
@@ -1525,19 +1504,21 @@ Terse command-style prompts produce shallow, generic work.
     promptSnippet: "Send a steering message to redirect a running background agent",
     parameters: Type.Object({
       agent_id: Type.String({
-        description: "The agent ID to steer (must be currently running).",
+        minLength: 1,
+        description: "Running agent ID returned by Agent.",
       }),
       message: Type.String({
-        description: "The steering message to send. This will appear as a user message in the agent's conversation.",
+        minLength: 1,
+        description: "Steering instruction delivered after the current tool execution and stored as a user message.",
       }),
-    }),
+    }, { additionalProperties: false }),
     execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
       const record = manager.getRecord(params.agent_id);
       if (!record || record.parentAgentId) {
-        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+        throw new Error(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
       if (record.status !== "running") {
-        return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
+        throw new Error(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
       }
       if (!record.session) {
         // Session not ready yet — queue the steer for delivery once initialized
@@ -1562,7 +1543,7 @@ Terse command-style prompts produce shallow, generic work.
           `Current state: ${stateParts.join(" · ")}`,
         );
       } catch (err) {
-        return textResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
+        throw new Error(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
       }
     },
   }));
@@ -1590,9 +1571,9 @@ Terse command-style prompts produce shallow, generic work.
     const label = getModelLabelFromConfig(cfg.model);
     if (!registry) return label;
     const resolved = resolveModel(cfg.model, registry);
-    // Configured but unresolvable: the runtime silently falls back to the parent
-    // model, so flag it (and the fallback) rather than hiding the config.
-    if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
+    // Configured but unresolvable: runtime fails closed rather than silently
+    // substituting the parent model.
+    if (typeof resolved === "string") return `${label} (unavailable)`;
     // Surface what it actually resolved to when that differs from the config —
     // e.g. a provider fallback or a looser version pin. Cosmetic separator/date
     // differences are normalized away so an effectively-identical match stays quiet.

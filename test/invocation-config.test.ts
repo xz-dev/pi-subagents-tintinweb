@@ -19,7 +19,7 @@ function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
 }
 
 describe("resolveAgentInvocationConfig", () => {
-  it("prefers agent config over tool-call params for locked fields", () => {
+  it("lets a nonblank tool-call model override frontmatter while other fields stay locked", () => {
     const resolved = resolveAgentInvocationConfig(
       makeConfig({
         model: "provider/config-model",
@@ -31,7 +31,7 @@ describe("resolveAgentInvocationConfig", () => {
         isolation: "worktree",
       }),
       {
-        model: "provider/param-model",
+        model: "  provider/param-model  ",
         thinking: "minimal",
         max_turns: 1,
         inherit_context: true,
@@ -41,8 +41,8 @@ describe("resolveAgentInvocationConfig", () => {
       },
     );
 
-    expect(resolved.modelInput).toBe("provider/config-model");
-    expect(resolved.modelFromParams).toBe(false);
+    expect(resolved.modelInput).toBe("provider/param-model");
+    expect(resolved.modelFromParams).toBe(true);
     expect(resolved.thinking).toBe("high");
     expect(resolved.maxTurns).toBe(42);
     expect(resolved.inheritContext).toBe(false);
@@ -50,6 +50,19 @@ describe("resolveAgentInvocationConfig", () => {
     expect(resolved.isolated).toBe(false);
     expect(resolved.isolation).toBe("worktree");
   });
+
+  it.each(["", "   ", "\t\n"]) (
+    "treats blank model %j as omitted instead of an explicit override",
+    (model) => {
+      const resolved = resolveAgentInvocationConfig(
+        makeConfig({ model: "provider/config-model" }),
+        { model },
+      );
+
+      expect(resolved.modelInput).toBe("provider/config-model");
+      expect(resolved.modelFromParams).toBe(false);
+    },
+  );
 
   it("uses tool-call params when no agent config is available", () => {
     const resolved = resolveAgentInvocationConfig(undefined, {

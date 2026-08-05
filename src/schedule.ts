@@ -120,6 +120,10 @@ export class SubagentScheduler {
       throw new Error(`A scheduled job named "${input.name}" already exists.`);
     }
     const job = this.buildJob(input);
+    if (job.model && this.ctx) {
+      const resolvedModel = resolveModel(job.model, this.ctx.modelRegistry);
+      if (typeof resolvedModel === "string") throw new Error(resolvedModel);
+    }
     store.add(job);
     if (job.enabled) this.scheduleJob(job);
     this.emit({ type: "added", job });
@@ -228,17 +232,19 @@ export class SubagentScheduler {
 
     store.update(id, { lastStatus: "running" });
 
-    // Resolve model at fire time — registry contents may have changed since the
-    // job was created (auth added/removed). Fall back silently to spawn-default
-    // if resolution fails; the spawn path handles undefined model gracefully.
-    let resolvedModel: any | undefined;
-    if (job.model) {
-      const r = resolveModel(job.model, ctx.modelRegistry);
-      if (typeof r !== "string") resolvedModel = r;
-    }
-
     let agentId: string;
     try {
+      // Re-resolve the stored selector at fire time: auth/availability may have
+      // changed since creation. A configured model is part of the scheduled
+      // operation's contract, so resolution failure is an error — never inherit
+      // the session/default model silently.
+      let resolvedModel: ReturnType<typeof resolveModel> | undefined;
+      if (job.model) {
+        const resolved = resolveModel(job.model, ctx.modelRegistry);
+        if (typeof resolved === "string") throw new Error(resolved);
+        resolvedModel = resolved;
+      }
+
       // Re-resolve at fire time against the registry as it stands. This does not
       // reload from disk (the scheduler has no reason to rebuild process-global
       // state from a timer), so it catches changes that went through /agents or

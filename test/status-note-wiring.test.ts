@@ -184,11 +184,18 @@ describe("status note reaches the parent through the real handlers", () => {
     for (const [name, params] of [
       ["get_subagent_result", { agent_id: id }],
       ["steer_subagent", { agent_id: id, message: "stop" }],
-      ["Agent", { resume: id, prompt: "continue", description: "resume", subagent_type: "general-purpose" }],
     ] as const) {
-      const result = await tools.get(name).execute("tc-nested", params, undefined, undefined, ctx());
-      expect(textOf(result)).toContain("Agent not found");
+      await expect(
+        tools.get(name).execute("tc-nested", params, undefined, undefined, ctx()),
+      ).rejects.toThrow("Agent not found");
     }
+    await expect(tools.get("Agent").execute(
+      "tc-nested",
+      { resume: id, prompt: "continue", description: "resume", subagent_type: "general-purpose" },
+      undefined,
+      undefined,
+      ctx(),
+    )).rejects.toThrow("Agent not found");
     expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:started", expect.objectContaining({ id }));
     expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:completed", expect.objectContaining({ id }));
     expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:failed", expect.objectContaining({ id }));

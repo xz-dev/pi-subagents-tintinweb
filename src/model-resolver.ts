@@ -25,6 +25,10 @@ export function resolveModel(
 ): any | string {
   // Available models (those with auth configured)
   const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
+  if (!input.trim()) {
+    const list = all.map(m => `  ${m.provider}/${m.id}`).sort().join("\n");
+    return `Model not found: "${input}".\n\nAvailable models:\n${list}`;
+  }
   const availableSet = new Set(all.map(m => `${m.provider}/${m.id}`.toLowerCase()));
 
   // 1. Exact match: "provider/modelId" — only if available (has auth)
@@ -45,7 +49,7 @@ export function resolveModel(
   const query = normalize(input);
 
   // Score each model: prefer exact id match > id contains > name contains > provider+id contains
-  let bestMatch: ModelEntry | undefined;
+  let bestMatches: ModelEntry[] = [];
   let bestScore = 0;
 
   for (const m of all) {
@@ -73,11 +77,18 @@ export function resolveModel(
 
     if (score > bestScore) {
       bestScore = score;
-      bestMatch = m;
+      bestMatches = [m];
+    } else if (score > 0 && score === bestScore) {
+      bestMatches.push(m);
     }
   }
 
-  if (bestMatch && bestScore >= 20) {
+  if (bestMatches.length > 1 && bestScore >= 20) {
+    const matches = bestMatches.map(m => `${m.provider}/${m.id}`).sort().join(", ");
+    return `Model "${input}" is ambiguous: ${matches}. Use an explicit provider/model.`;
+  }
+  if (bestMatches.length === 1 && bestScore >= 20) {
+    const bestMatch = bestMatches[0];
     const found = registry.find(bestMatch.provider, bestMatch.id);
     if (found) return found;
   }

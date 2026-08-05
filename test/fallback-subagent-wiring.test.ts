@@ -106,7 +106,7 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
       const { tools } = boot();
       setFallbackSubagent(NO_FALLBACK);
 
-      const result = await tools.get("Agent").execute(
+      await expect(tools.get("Agent").execute(
         "tc-1",
         {
           prompt: "do it",
@@ -115,10 +115,7 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
           run_in_background: background,
         },
         undefined, undefined, ctx(),
-      );
-
-      expect(textOf(result)).toContain('Unknown or disabled agent type: "definitely-missing"');
-      expect(textOf(result)).toContain("scout");
+      )).rejects.toThrow('Unknown or disabled agent type: "definitely-missing"');
       // The whole point: nothing ran.
       expect(runAgent).not.toHaveBeenCalled();
     });
@@ -172,13 +169,11 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
     expect(getAllTypes()).toContain("retired");
     expect(getAvailableTypes()).not.toContain("retired");
 
-    const result = await tools.get("Agent").execute(
+    await expect(tools.get("Agent").execute(
       "tc-4",
       { prompt: "do it", description: "disabled dispatch", subagent_type: "retired" },
       undefined, undefined, ctx(),
-    );
-
-    expect(textOf(result)).toContain("Unknown or disabled agent type");
+    )).rejects.toThrow("Unknown or disabled agent type");
     expect(runAgent).not.toHaveBeenCalled();
   });
 
@@ -208,9 +203,16 @@ describe("fallbackSubagent gates dispatch through the real Agent tool", () => {
     // unused. Gating it would make a live agent unresumable the moment its type
     // is deleted or disabled — the opposite of what strict dispatch is for.
     const { tools } = boot();
-    vi.mocked(runAgent).mockResolvedValue({
-      responseText: "first", session: { dispose: vi.fn() } as any, aborted: false, steered: false,
-    });
+    const session = {
+      dispose: vi.fn(),
+      messages: [],
+      subscribe: vi.fn(() => vi.fn()),
+      prompt: vi.fn(),
+      state: { messages: [] },
+    } as any;
+    vi.mocked(runAgent)
+      .mockResolvedValueOnce({ responseText: "first", session, aborted: false, steered: false })
+      .mockResolvedValueOnce({ responseText: "continued", session, aborted: false, steered: false });
     const spawned = await tools.get("Agent").execute(
       "tc-6",
       { prompt: "start", description: "live agent", subagent_type: "scout" },

@@ -162,14 +162,13 @@ describe("issue #174: foreground agent that hits max_turns", () => {
 
     // An invented id is correctly rejected — this is the reporter's error,
     // reproduced WITHOUT any record having been cleaned up.
-    const bogus = await tools.get("get_subagent_result").execute(
+    await expect(tools.get("get_subagent_result").execute(
       "tc-bogus",
       { agent_id: "3f1320a7-74ec-422" },
       undefined,
       undefined,
       ctx(),
-    );
-    expect(textOf(bogus)).toContain("Agent not found");
+    )).rejects.toThrow("Agent not found");
 
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
@@ -211,8 +210,9 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     // them. This is the ONLY path that makes a foreground id stop resolving.
     await lifecycle.get("session_before_switch")?.();
 
-    const read = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
-    expect(textOf(read)).toContain("Agent not found");
+    await expect(
+      tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx()),
+    ).rejects.toThrow("Agent not found");
 
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });

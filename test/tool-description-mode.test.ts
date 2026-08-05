@@ -124,9 +124,41 @@ describe("toolDescriptionMode", () => {
       'isolation: "worktree"',
       ".pi/agents/",
       "self-contained",
+      "frontmatter",
+      "completion is delivered automatically",
     ]) {
       expect(desc).toContain(contract);
     }
+  });
+
+  it("publishes strict Google-compatible parameter schemas for every top-level tool", () => {
+    const tools = setup();
+    for (const name of ["Agent", "get_subagent_result", "steer_subagent"]) {
+      expect(tools.get(name).parameters.additionalProperties, name).toBe(false);
+    }
+
+    const schema = tools.get("Agent").parameters;
+    expect(schema.properties.thinking).toMatchObject({
+      type: "string",
+      enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    });
+    expect(schema.properties.isolation).toMatchObject({
+      type: "string",
+      enum: ["worktree"],
+    });
+    expect(schema.properties.max_turns).toMatchObject({ type: "integer", minimum: 1 });
+  });
+
+  it("describes spawn precedence, resume exclusivity, and automatic background completion", () => {
+    const tool = setup().get("Agent");
+    const schemaText = JSON.stringify(tool.parameters);
+    const modelDescription = tool.parameters.properties.model.description;
+    const resumeDescription = tool.parameters.properties.resume.description;
+
+    expect(modelDescription).toContain("overrides agent frontmatter");
+    expect(resumeDescription).toContain("Only prompt and resume are used");
+    expect(schemaText).toContain("frontmatter takes precedence");
+    expect(tool.description.toLowerCase()).toContain("completion is delivered automatically");
   });
 
   it("custom mode renders the project template with placeholders substituted", () => {
