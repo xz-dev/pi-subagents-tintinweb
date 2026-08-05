@@ -13,15 +13,20 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme, keyHint } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { AgentManager } from "./agent-manager.js";
+import {
+  formatAgentOutcome,
+  outcomeForRecord,
+  sanitizeAgentCause,
+} from "./agent-outcome.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
-import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
+import { type RpcHandle, registerRpcHandlers, type SpawnCapable } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
@@ -33,28 +38,42 @@ import { createOutputFilePath, getOutputTranscriptDefault, setOutputTranscriptDe
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
-import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentRecord, type IsolationMode, type IsolationPreference, type JoinMode, type NotificationDetails, type SubagentType, type ThinkingLevel, type WidgetMode } from "./types.js";
+import { getForegroundOutcomeNote, getStatusNote } from "./status-note.js";
+import { type AgentConfig, type AgentInvocation, type AgentRecord, type IsolationPreference, type JoinMode, type NotificationDetails, type SubagentType, type ThinkingLevel, type WidgetMode } from "./types.js";
 import {
   type AgentActivity,
   type AgentDetails,
   AgentWidget,
+  activityDurationMs,
   buildInvocationTags,
   describeActivity,
   fgPreservingNestedStyles,
+  formatActivityWithElapsed,
   formatDuration,
   formatMs,
   formatTokens,
   formatTurns,
   getDisplayName,
   getPromptModeLabel,
+  prepareModelNameForDisplay,
   SPINNER,
   type Theme,
   type UICtx,
 } from "./ui/agent-widget.js";
 import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
+import { prepareConversationDisplay } from "./ui/prepare-conversation-display.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
+
+const collapseResultByStatus: Record<AgentRecord["status"], boolean> = {
+  queued: false,
+  running: false,
+  completed: true,
+  steered: true,
+  aborted: true,
+  stopped: true,
+  error: false,
+};
 
 // ---- Shared helpers ----
 
@@ -63,15 +82,41 @@ function textResult(msg: string, details?: AgentDetails) {
   return { content: [{ type: "text" as const, text: msg }], details: details as any };
 }
 
+export function prepareInvocationTagLines(rawTags: string[]): string[] {
+  return rawTags.flatMap((tag) => {
+    const prepared = prepareConversationDisplay(tag);
+    return [...(prepared.warning ? [prepared.warning] : []), ...prepared.lines];
+  });
+}
+
+/** Invocation rejection: throwing is what Pi serializes as isError=true. */
+function rejectInvocation(cause: unknown): never {
+  throw new Error(sanitizeAgentCause(cause));
+}
+
+function formatAcceptedRecord(record: AgentRecord): string {
+  const outcome = outcomeForRecord(record);
+  const sections = [formatAgentOutcome(outcome)];
+  const output = record.result?.trim();
+  if (output) {
+    sections.push(record.status === "error"
+      ? `Partial output before the failure:\n${output}`
+      : `Agent output:\n${output}`);
+  }
+  return sections.join("\n\n");
+}
+
 export function renderRunningAgentStatus(
   frame: string,
   statsText: string,
   activity: string,
   theme: Pick<Theme, "fg">,
+  activityDuration?: number,
 ): Container {
   const container = new Container();
+  const activityText = activityDuration == null ? activity : formatActivityWithElapsed(activity, activityDuration);
   container.addChild(new Text(theme.fg("accent", frame) + (statsText ? " " + statsText : ""), 0, 0));
-  container.addChild(new Text(theme.fg("dim", `  ⎿  ${activity}`), 0, 0));
+  container.addChild(new Text(fgPreservingNestedStyles(theme, "dim", `  ⎿  ${activityText}`), 0, 0));
   return container;
 }
 
@@ -154,7 +199,7 @@ function escapeXml(s: string): string {
 }
 
 /** Format a structured task notification matching Claude Code's <task-notification> XML. */
-function formatTaskNotification(record: AgentRecord, resultMaxLen: number): string {
+export function formatTaskNotification(record: AgentRecord, resultMaxLen: number): string {
   const status = getStatusLabel(record.status, record.error);
   const durationMs = record.completedAt ? record.completedAt - record.startedAt : 0;
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
@@ -162,11 +207,17 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number): stri
   const ctxXml = contextPercent !== null ? `<context_percent>${Math.round(contextPercent)}</context_percent>` : "";
   const compactXml = record.compactionCount ? `<compactions>${record.compactionCount}</compactions>` : "";
 
-  const resultPreview = record.result
-    ? record.result.length > resultMaxLen
-      ? record.result.slice(0, resultMaxLen) + "\n...(truncated, use get_subagent_result for full output)"
-      : record.result
-    : "No output.";
+  const output = record.result?.trim();
+  const rawOutput = output || record.error || "No output.";
+  const resultPreview = rawOutput.length > resultMaxLen
+    ? rawOutput.slice(0, resultMaxLen) + "\n...(truncated, use get_subagent_result for full output)"
+    : rawOutput;
+  const modelText = record.outcome
+    ? [
+      formatAgentOutcome(record.outcome),
+      output && `${record.status === "error" ? "Partial output before the failure" : "Partial output"}:\n${resultPreview}`,
+    ].filter(Boolean).join("\n\n")
+    : resultPreview;
 
   return [
     `<task-notification>`,
@@ -175,16 +226,26 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number): stri
     record.outputFile ? `<output-file>${escapeXml(record.outputFile)}</output-file>` : null,
     `<status>${escapeXml(status)}</status>`,
     `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
-    `<result>${escapeXml(resultPreview)}</result>`,
+    `<result>${escapeXml(modelText)}</result>`,
     `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join('\n');
 }
 
+/** Read current runtime model/thinking, falling back to the pre-session invocation snapshot. */
+function getRuntimeInvocation(record: Pick<AgentRecord, "invocation" | "session"> | undefined): AgentInvocation | undefined {
+  if (!record?.session?.model) return record?.invocation;
+  return {
+    ...record.invocation,
+    modelName: `${record.session.model.provider}/${record.session.model.id}`,
+    thinking: record.session.thinkingLevel,
+  };
+}
+
 /** Build AgentDetails from a base + record-specific fields. */
 function buildDetails(
   base: Pick<AgentDetails, "displayName" | "description" | "subagentType" | "modelName" | "tags">,
-  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage },
+  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; outcome?: AgentRecord["outcome"]; id?: string; session?: AgentSession; lifetimeUsage: LifetimeUsage },
   activity?: AgentActivity,
   overrides?: Partial<AgentDetails>,
 ): AgentDetails {
@@ -198,6 +259,7 @@ function buildDetails(
     status: record.status as AgentDetails["status"],
     agentId: record.id,
     error: record.error,
+    outcome: record.outcome,
     ...overrides,
   };
 }
@@ -217,11 +279,12 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
     durationMs: record.completedAt ? record.completedAt - record.startedAt : 0,
     outputFile: record.outputFile,
     error: record.error,
+    outcome: record.outcome,
     resultPreview: record.result
       ? record.result.length > resultMaxLen
         ? record.result.slice(0, resultMaxLen) + "…"
         : record.result
-      : "No output.",
+      : undefined,
   };
 }
 
@@ -258,13 +321,15 @@ export default function (pi: ExtensionAPI) {
           line += "\n  " + parts.map(p => theme.fg("dim", p)).join(" " + theme.fg("dim", "·") + " ");
         }
 
-        // Line 3: result preview (collapsed) or full (expanded)
-        if (expanded) {
-          const lines = d.resultPreview.split("\n").slice(0, 30);
-          for (const l of lines) line += "\n" + theme.fg("dim", `  ${l}`);
-        } else {
-          const preview = d.resultPreview.split("\n")[0]?.slice(0, 80) ?? "";
-          line += "\n  " + theme.fg("dim", `⎿  ${preview}`);
+        // Line 3: actual result preview (collapsed) or full (expanded)
+        if (d.resultPreview !== undefined) {
+          if (expanded) {
+            const lines = d.resultPreview.split("\n").slice(0, 30);
+            for (const l of lines) line += "\n" + theme.fg("dim", `  ${l}`);
+          } else {
+            const preview = d.resultPreview.split("\n")[0]?.slice(0, 80) ?? "";
+            line += "\n  " + theme.fg("dim", `⎿  ${preview}`);
+          }
         }
 
         // Line 4: output file link (if present)
@@ -329,7 +394,7 @@ export default function (pi: ExtensionAPI) {
       content: notification + footer,
       display: true,
       details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
+    }, { deliverAs: "steer", triggerTurn: true });
   }
 
   function sendIndividualNudge(record: AgentRecord) {
@@ -367,7 +432,7 @@ export default function (pi: ExtensionAPI) {
           content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
           display: true,
           details,
-        }, { deliverAs: "followUp", triggerTurn: true });
+        }, { deliverAs: "steer", triggerTurn: true });
       });
       widget.update();
     },
@@ -392,6 +457,7 @@ export default function (pi: ExtensionAPI) {
       description: record.description,
       result: record.result,
       error: record.error,
+      outcome: record.outcome,
       status: record.status,
       toolUses: record.toolUses,
       durationMs,
@@ -406,9 +472,9 @@ export default function (pi: ExtensionAPI) {
     if (record.parentAgentId) return;
 
     // Emit lifecycle event based on terminal status
-    const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
+    const isIncomplete = record.status === "error" || record.status === "stopped" || record.status === "aborted";
     const eventData = buildEventData(record);
-    if (isError) {
+    if (isIncomplete) {
       pi.events.emit("subagents:failed", eventData);
     } else {
       pi.events.emit("subagents:completed", eventData);
@@ -418,6 +484,7 @@ export default function (pi: ExtensionAPI) {
     pi.appendEntry("subagents:record", {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
+      outcome: record.outcome,
       startedAt: record.startedAt, completedAt: record.completedAt,
     });
 
@@ -510,6 +577,35 @@ export default function (pi: ExtensionAPI) {
     (globalThis as any)[MANAGER_KEY] = registryEntry;
   }
 
+  // Cross-extension callers such as pi-tasks bypass the Agent tool, so they do
+  // not create its UI activity tracker. Wrap only that programmatic spawn path
+  // with the same callbacks before AgentManager starts the child session.
+  const rpcManager: SpawnCapable = {
+    spawn(piRef, ctxRef, type, prompt, options) {
+      const { state, callbacks } = createActivityTracker(options.maxTurns);
+      // Wrap spawnTopLevel (not raw manager.spawn) so RPC-spawned agents keep
+      // the #164 internal-option sanitization while gaining activity tracking.
+      const id = spawnTopLevel(
+        piRef,
+        ctxRef,
+        type,
+        prompt,
+        { ...options, ...callbacks },
+      );
+      agentActivity.set(id, state);
+      widget.ensureTimer();
+      widget.update();
+      fleet.ensureTimer();
+      fleet.update();
+      return id;
+    },
+    // Preserve the #164 guard: RPC must not abort nested (child) agents.
+    abort: (id) => {
+      const record = manager.getRecord(id);
+      return !record?.parentAgentId && manager.abort(id);
+    },
+  };
+
   // --- Cross-extension RPC via pi.events ---
   let currentCtx: ExtensionContext | undefined;
   // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
@@ -555,13 +651,7 @@ export default function (pi: ExtensionAPI) {
         events: pi.events,
         pi,
         getCtx: () => currentCtx,
-        manager: {
-          spawn: spawnTopLevel,
-          abort: (id) => {
-            const record = manager.getRecord(id);
-            return !record?.parentAgentId && manager.abort(id);
-          },
-        },
+        manager: rpcManager,
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.
       // Emitting after all factories have run (rather than at factory time)
@@ -806,7 +896,7 @@ Notes:
 - Parallel work: one message, multiple Agent calls, run_in_background: true on each. Background completion is delivered automatically — never poll or sleep.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues the exact prior session using only prompt + resume; steer_subagent messages a running one.
-- isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch. isolation: "off" explicitly disables worktree isolation, including a custom agent's worktree default.`;
+- isolation: "worktree" runs in a Git worktree; isolation: "off" disables an agent default. Never initialize or commit solely to enable isolation.`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -836,7 +926,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use a nonblank model to override the selected agent's frontmatter model (as "provider/modelId", or an unambiguous fuzzy name). Blank means omitted.
 - Agent frontmatter takes precedence for thinking, max_turns, run_in_background, inherit_context, and isolated; call values fill only fields frontmatter leaves unspecified.
 - With resume, only prompt and resume are used. Omit spawn-only fields; use steer_subagent to redirect a running agent.
-- Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications), or isolation: "off" to explicitly disable worktree isolation even when the chosen agent defaults to it. The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.${scheduleGuideline}
+- Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications), or isolation: "off" to explicitly disable an agent default. The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.${scheduleGuideline}
 
 ## Writing the prompt
 
@@ -912,7 +1002,10 @@ Terse command-style prompts produce shallow, generic work.
     parameters: Type.Object({
       prompt: Type.String({ minLength: 1, description: "Self-contained task or continuation prompt." }),
       description: Type.String({ minLength: 1, description: "Short task summary for a new spawn; ignored on resume." }),
-      subagent_type: Type.String({ minLength: 1, description: `Agent type for a new spawn; ignored on resume. Available: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.` }),
+      subagent_type: Type.String({
+        minLength: 1,
+        description: `Agent type for a new spawn; ignored on resume. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
+      }),
       model: Type.Optional(Type.String({
         description: 'Nonblank model override for a new spawn. Accepts "provider/modelId" or an unambiguous fuzzy name and overrides agent frontmatter. Blank means omitted; ignored on resume.',
       })),
@@ -920,24 +1013,30 @@ Terse command-style prompts produce shallow, generic work.
         description: "Requested thinking level when agent frontmatter does not define one; ignored on resume.",
       }))),
       max_turns: Type.Optional(Type.Integer({
-        description: "Maximum turns when agent frontmatter does not define one. Omit for the configured default; ignored on resume.",
+        description: "Maximum number of agentic turns before stopping. Omit for the configured default; ignored on resume.",
         minimum: 1,
       })),
-      run_in_background: Type.Optional(Type.Boolean({
-        description: "Run a new agent in background. Agent frontmatter takes precedence. Completion is delivered automatically; ignored on resume.",
-      })),
+      run_in_background: Type.Optional(
+        Type.Boolean({
+          description: "Run a new agent in background. Agent frontmatter takes precedence. Completion is delivered automatically; ignored on resume.",
+        }),
+      ),
       resume: Type.Optional(Type.String({
         minLength: 1,
-        description: "Existing agent ID to continue. Only prompt and resume are used; omit model, thinking, max_turns, run_in_background, inherit_context, isolated, isolation, and schedule.",
+        description: "Existing agent ID to continue. Only prompt and resume are used; omit spawn-only fields.",
       })),
-      isolated: Type.Optional(Type.Boolean({
-        description: "Disable extension/MCP tools when agent frontmatter does not define isolated; ignored on resume.",
-      })),
-      inherit_context: Type.Optional(Type.Boolean({
-        description: "Fork parent context when agent frontmatter does not define inheritance. Default false; ignored on resume.",
-      })),
+      isolated: Type.Optional(
+        Type.Boolean({
+          description: "If true, agent gets no extension/MCP tools — only built-in tools.",
+        }),
+      ),
+      inherit_context: Type.Optional(
+        Type.Boolean({
+          description: "If true, fork parent conversation into the agent. Default: false (fresh context).",
+        }),
+      ),
       isolation: Type.Optional(Type.Unsafe<IsolationPreference>(StringEnum(["worktree", "off"] as const, {
-        description: 'Use "worktree" for a temporary Git worktree, or "off" to explicitly disable worktree isolation (including an agent default); ignored on resume.',
+        description: 'Use "worktree" for an isolated copy or "off" to explicitly run without one. Omit for the agent default, read-only work, or a non-Git cwd.',
       }))),
       ...scheduleParam,
     }, { additionalProperties: false }),
@@ -950,17 +1049,27 @@ Terse command-style prompts produce shallow, generic work.
       return new Text("▸ " + theme.fg("toolTitle", theme.bold(displayName)) + (desc ? "  " + theme.fg("muted", desc) : ""), 0, 0);
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, { expanded, isPartial }, theme, renderContext) {
       const details = result.details as AgentDetails | undefined;
-      if (!details) {
-        const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      const knownStatuses = new Set<AgentDetails["status"]>([
+        "running",
+        "background",
+        "completed",
+        "steered",
+        "stopped",
+        "error",
+        "aborted",
+      ]);
+      if (renderContext.isError || !details || !knownStatuses.has(details.status)) {
         return new Text(text, 0, 0);
       }
 
-      // Helper: build "haiku · thinking: high · ↻5≤30 · 3 tool uses · 33.8k tokens" stats string
+      // Helper: build "model · thinking: high · ↻5≤30 · 3 tool uses · 33.8k tokens" stats string
       const stats = (d: AgentDetails) => {
         const parts: string[] = [];
-        if (d.modelName) parts.push(d.modelName);
+        const modelName = prepareModelNameForDisplay(d.modelName);
+        if (modelName) parts.push(modelName);
         if (d.tags) parts.push(...d.tags);
         if (d.turnCount != null && d.turnCount > 0) {
           parts.push(formatTurns(d.turnCount, d.maxTurns));
@@ -974,12 +1083,14 @@ Terse command-style prompts produce shallow, generic work.
       if (isPartial || details.status === "running") {
         const frame = SPINNER[details.spinnerFrame ?? 0];
         const s = stats(details);
-        return renderRunningAgentStatus(frame, s, details.activity ?? "thinking…", theme);
+        return renderRunningAgentStatus(frame, s, details.activity ?? "thinking…", theme, details.activityDurationMs);
       }
 
       // ---- Background agent launched ----
       if (details.status === "background") {
-        return new Text(theme.fg("dim", `  ⎿  Running in background (ID: ${details.agentId})`), 0, 0);
+        const s = stats(details);
+        const line = (s ? `${s}\n` : "") + theme.fg("dim", `  ⎿  Running in background (ID: ${details.agentId})`);
+        return new Text(line, 0, 0);
       }
 
       // ---- Completed / Steered ----
@@ -1051,25 +1162,26 @@ Terse command-style prompts produce shallow, generic work.
       if (params.resume) {
         const existing = manager.getRecord(params.resume);
         if (!existing || existing.parentAgentId) {
-          throw new Error(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+          rejectInvocation(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }
-        if (!existing.session) {
-          throw new Error(`Agent "${params.resume}" has no active session to resume.`);
-        }
+        if (!existing.session) rejectInvocation(`Agent "${params.resume}" has no active session to resume.`);
         const record = await manager.resume(params.resume, params.prompt, signal);
-        if (!record) throw new Error(`Failed to resume agent "${params.resume}".`);
-        if (record.status === "error") {
-          throw new Error(`Agent failed: ${record.error}${partialOutputSuffix(record)}`);
-        }
-        return textResult(record.result?.trim() || "No output.", buildDetails({
+        if (!record) rejectInvocation(`Failed to resume agent "${params.resume}".`);
+        const resumedInvocation = buildInvocationTags(getRuntimeInvocation(record));
+        return textResult(formatAcceptedRecord(record), buildDetails({
           displayName: getDisplayName(record.type),
           description: record.description,
           subagentType: record.type,
+          modelName: resumedInvocation.modelName,
+          tags: resumedInvocation.tags.length > 0 ? resumedInvocation.tags : undefined,
         }, record));
       }
-
-      if (!dispatch.ok) throw new Error(dispatch.message);
-      const subagentType = dispatch.type;
+      // `resume` replays a stored session and ignores `subagent_type` entirely,
+      // but the parameter is required by the schema — so gating it here would
+      // make a live agent unresumable the moment its type is deleted, disabled,
+      // or gains a case-clashing sibling. Only a real spawn is gated.
+      if (!dispatch.ok && !params.resume) rejectInvocation(dispatch.message);
+      const subagentType = dispatch.ok ? dispatch.type : rawType;
       // What the caller actually asked for, named once: `fellBackFrom` is "" for
       // a blank request, so reading it inline invites the `??`-vs-`||` slip that
       // once persisted an empty type into a scheduled job.
@@ -1093,6 +1205,10 @@ Terse command-style prompts produce shallow, generic work.
         thinking: params.thinking as string | undefined,
         isolation: params.isolation as IsolationPreference | undefined,
       });
+      if (resolvedConfig.modelFromParams && resolvedConfig.modelInput) {
+        const explicitModel = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
+        if (typeof explicitModel === "string") rejectInvocation(explicitModel);
+      }
 
       // Preserve the existing config-only invocation seam when the parent has
       // no model (notably headless/tests); runAgent still resolves that config.
@@ -1100,8 +1216,7 @@ Terse command-style prompts produce shallow, generic work.
       // fallback chain is actually configured.
       const shouldResolveCandidates = ctx.model !== undefined ||
         resolvedConfig.fallbackModels !== undefined ||
-        (loadedSettings.defaultFallbackModels?.length ?? 0) > 0 ||
-        resolvedConfig.modelFromParams || params.schedule !== undefined;
+        (loadedSettings.defaultFallbackModels?.length ?? 0) > 0 || resolvedConfig.modelFromParams;
       const candidateResolution = shouldResolveCandidates
         ? resolveModelCandidates({
             primary: resolvedConfig.modelInput ? undefined : ctx.model,
@@ -1112,23 +1227,20 @@ Terse command-style prompts produce shallow, generic work.
             registry: ctx.modelRegistry,
           })
         : undefined;
-      const model = shouldResolveCandidates
-        ? candidateResolution?.models[0]
-        : ctx.model;
+      const model = candidateResolution?.models[0] ?? ctx.model;
       const hasConfiguredModelChain = resolvedConfig.modelInput !== undefined ||
         resolvedConfig.fallbackModels !== undefined ||
         (loadedSettings.defaultFallbackModels?.length ?? 0) > 0;
       if (shouldResolveCandidates && !model && hasConfiguredModelChain) {
-        const candidates = candidateResolution?.candidates ?? [];
-        if (resolvedConfig.modelFromParams && candidates.length === 1 && candidates[0]?.error) {
-          throw new Error(candidates[0].error);
-        }
-        const diagnostics = formatModelAttempts(candidates.map(candidate => ({
+        const diagnostics = formatModelAttempts((candidateResolution?.candidates ?? []).map(candidate => ({
           model: candidate.input,
           status: "unavailable",
           error: candidate.error,
         })));
-        throw new Error(fallbackNote ? `${fallbackNote}${diagnostics}` : diagnostics);
+        if (resolvedConfig.modelFromParams) {
+          rejectInvocation(candidateResolution?.candidates[0]?.error ?? diagnostics);
+        }
+        return textResult(fallbackNote ? `${fallbackNote}${diagnostics}` : diagnostics);
       }
 
       // Scope validation: the effective resolved model is checked against the
@@ -1142,7 +1254,7 @@ Terse command-style prompts produce shallow, generic work.
         agentLabel: customConfig?.displayName ?? subagentType,
         modelInput: resolvedConfig.modelInput,
       });
-      if (scopeVerdict.kind === "error") throw new Error(scopeVerdict.message);
+      if (scopeVerdict.kind === "error") rejectInvocation(scopeVerdict.message);
       if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
 
       const thinking = resolvedConfig.thinking;
@@ -1162,11 +1274,7 @@ Terse command-style prompts produce shallow, generic work.
         writeInitialEntry(rec.outputFile, agentId, params.prompt, ctx.cwd);
       };
 
-      const parentModelId = ctx.model?.id;
-      const effectiveModelId = model?.id;
-      const modelName = effectiveModelId && effectiveModelId !== parentModelId
-        ? (model?.name ?? effectiveModelId).replace(/^Claude\s+/i, "").toLowerCase()
-        : undefined;
+      const modelName = model ? `${model.provider}/${model.id}` : undefined;
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
       const agentInvocation: AgentInvocation = {
         modelName,
@@ -1181,7 +1289,8 @@ Terse command-style prompts produce shallow, generic work.
       };
       // Tool-result render shows the mode label too; viewer's header already does.
       const modeLabel = getPromptModeLabel(subagentType);
-      const { tags: invocationTags } = buildInvocationTags(agentInvocation);
+      const { tags: rawInvocationTags } = buildInvocationTags(agentInvocation);
+      const invocationTags = prepareInvocationTagLines(rawInvocationTags);
       const agentTags = modeLabel ? [modeLabel, ...invocationTags] : invocationTags;
       const detailBase = {
         displayName,
@@ -1194,19 +1303,19 @@ Terse command-style prompts produce shallow, generic work.
       // ---- Schedule: register a job, don't spawn now ----
       if (params.schedule) {
         if (!isSchedulingEnabled()) {
-          throw new Error("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
+          rejectInvocation("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
         }
         if (params.resume) {
-          throw new Error("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
+          rejectInvocation("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
         }
         if (params.inherit_context) {
-          throw new Error("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
+          rejectInvocation("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
         }
         if (params.run_in_background === false) {
-          throw new Error("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
+          rejectInvocation("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
         }
         if (!scheduler.isActive()) {
-          throw new Error("Scheduler is not active in this session yet. Try again after the session has fully started.");
+          rejectInvocation("Scheduler is not active in this session yet. Try again after the session has fully started.");
         }
         try {
           const job = scheduler.addJob({
@@ -1217,7 +1326,7 @@ Terse command-style prompts produce shallow, generic work.
             // at fire time, and the original is what a user edits.
             subagent_type: requestedType,
             prompt: params.prompt as string,
-            model: candidateResolution?.candidates[0]?.input ?? resolvedConfig.modelInput,
+            model: params.model as string | undefined,
             thinking: thinking,
             max_turns: effectiveMaxTurns,
             isolated: isolated,
@@ -1230,7 +1339,7 @@ Terse command-style prompts produce shallow, generic work.
             `Manage via /agents → Scheduled jobs.`,
           );
         } catch (err) {
-          throw err instanceof Error ? err : new Error(String(err));
+          rejectInvocation(err);
         }
       }
 
@@ -1251,25 +1360,21 @@ Terse command-style prompts produce shallow, generic work.
           }
         };
 
-        try {
-          id = manager.spawn(pi, ctx, subagentType, params.prompt, {
-            description: params.description,
-            model,
-            modelCandidates: candidateResolution?.candidates,
-            callerSuppliedModel: resolvedConfig.modelFromParams,
-            maxTurns: effectiveMaxTurns,
-            isolated,
-            inheritContext,
-            thinkingLevel: thinking,
-            isBackground: true,
-            isolation,
-            invocation: agentInvocation,
-            rootSessionId: ctx.sessionManager.getSessionId(),
-            ...bgCallbacks,
-          });
-        } catch (err) {
-          throw err instanceof Error ? err : new Error(String(err));
-        }
+        id = manager.spawn(pi, ctx, subagentType, params.prompt, {
+          description: params.description,
+          model,
+          modelCandidates: candidateResolution?.candidates,
+          callerSuppliedModel: resolvedConfig.modelFromParams,
+          maxTurns: effectiveMaxTurns,
+          isolated,
+          inheritContext,
+          thinkingLevel: thinking,
+          isBackground: true,
+          isolation,
+          invocation: agentInvocation,
+          rootSessionId: ctx.sessionManager.getSessionId(),
+          ...bgCallbacks,
+        });
 
         // Set output file + join mode synchronously after spawn, before the
         // event loop yields — onSessionCreated is async so this is safe.
@@ -1307,6 +1412,12 @@ Terse command-style prompts produce shallow, generic work.
         });
 
         const isQueued = record?.status === "queued";
+        const runtimeInvocation = buildInvocationTags(getRuntimeInvocation(record));
+        const backgroundDetails = {
+          ...detailBase,
+          modelName: runtimeInvocation.modelName ?? detailBase.modelName,
+          tags: runtimeInvocation.tags.length > 0 ? runtimeInvocation.tags : detailBase.tags,
+        };
         return textResult(
           `${fallbackNote}Agent ${isQueued ? "queued" : "started"} in background.\n` +
           `Agent ID: ${id}\n` +
@@ -1314,10 +1425,10 @@ Terse command-style prompts produce shallow, generic work.
           `Description: ${params.description}\n` +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-          `\nCompletion is delivered automatically. Continue independent work instead of polling.\n` +
-          `Use get_subagent_result only when blocking is required, or steer_subagent to redirect the running agent.\n` +
+          `\nYou will be notified when this agent completes.\n` +
+          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
           `Do not duplicate this agent's work.`,
-          { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
+          { ...backgroundDetails, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
         );
       }
 
@@ -1327,15 +1438,20 @@ Terse command-style prompts produce shallow, generic work.
       let fgId: string | undefined;
 
       const streamUpdate = () => {
+        const runtimeInvocation = buildInvocationTags(getRuntimeInvocation(fgId ? manager.getRecord(fgId) : undefined));
+        const activity = describeActivity(fgState.activeTools, fgState.responseText);
         const details: AgentDetails = {
           ...detailBase,
+          modelName: runtimeInvocation.modelName ?? detailBase.modelName,
+          tags: runtimeInvocation.tags.length > 0 ? runtimeInvocation.tags : detailBase.tags,
           toolUses: fgState.toolUses,
           tokens: formatLifetimeTokens(fgState),
           turnCount: fgState.turnCount,
           maxTurns: fgState.maxTurns,
           durationMs: Date.now() - startedAt,
           status: "running",
-          activity: describeActivity(fgState.activeTools, fgState.responseText),
+          activity,
+          activityDurationMs: activityDurationMs(fgState, activity),
           spinnerFrame: spinnerFrame % SPINNER.length,
         };
         onUpdate?.({
@@ -1404,7 +1520,7 @@ Terse command-style prompts produce shallow, generic work.
         record = fgResult.record;
       } catch (err) {
         clearInterval(spinnerInterval);
-        throw err instanceof Error ? err : new Error(String(err));
+        throw err;
       }
 
       clearInterval(spinnerInterval);
@@ -1419,11 +1535,18 @@ Terse command-style prompts produce shallow, generic work.
       // Get final token count
       const tokenText = formatLifetimeTokens(fgState);
 
-      const details = buildDetails(detailBase, record, fgState, { tokens: tokenText });
+      const runtimeInvocation = buildInvocationTags(getRuntimeInvocation(record));
+      const runtimeDetails = {
+        ...detailBase,
+        modelName: runtimeInvocation.modelName ?? detailBase.modelName,
+        tags: runtimeInvocation.tags.length > 0 ? runtimeInvocation.tags : detailBase.tags,
+      };
+      const details = buildDetails(runtimeDetails, record, fgState, { tokens: tokenText });
 
-      if (record.status === "error") {
-        // Error headline + any partial output the run produced before failing.
-        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
+      const incomplete = record.status === "error" || record.status === "steered" ||
+        record.status === "aborted" || record.status === "stopped";
+      if (incomplete) {
+        return textResult(`${fallbackNote}${formatAcceptedRecord(record)}`, details);
       }
 
       const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
@@ -1448,23 +1571,38 @@ Terse command-style prompts produce shallow, generic work.
     parameters: Type.Object({
       agent_id: Type.String({
         minLength: 1,
-        description: "Background agent ID returned by Agent.",
+        description: "The agent ID to check.",
       }),
       wait: Type.Optional(
         Type.Boolean({
-          description: "Wait abortably for completion. Default false; cancelling this wait does not stop the agent. Prefer automatic completion delivery unless blocking is required.",
+          description: "If true, wait for the agent to complete before returning. Default: false.",
         }),
       ),
       verbose: Type.Optional(
         Type.Boolean({
-          description: "Include the full conversation (messages + tool calls), which may be large. Default false.",
+          description: "If true, include the agent's full conversation (messages + tool calls). Default: false.",
         }),
       ),
     }, { additionalProperties: false }),
+    renderResult(result, { expanded, isPartial }, theme) {
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      const details = result.details as { status?: AgentRecord["status"] } | undefined;
+      const status = details?.status;
+      if (expanded || isPartial || status === undefined || !collapseResultByStatus[status]) {
+        return new Text(text, 0, 0);
+      }
+      return new Text(
+        theme.fg("dim", "  ⎿  Result available (") +
+          keyHint("app.tools.expand", "to expand") +
+          theme.fg("dim", ")"),
+        0,
+        0,
+      );
+    },
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
       const record = manager.getRecord(params.agent_id);
       if (!record || record.parentAgentId) {
-        throw new Error(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+        rejectInvocation(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
 
       // Wait for completion if requested. Cancellation stops only this tool
@@ -1496,13 +1634,17 @@ Terse command-style prompts produce shallow, generic work.
         `Agent: ${record.id}\n` +
         `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
         `Description: ${record.description}\n\n`;
+      const details = buildDetails(
+        { displayName, description: record.description, subagentType: record.type },
+        record,
+      );
 
-      if (record.status === "running") {
-        output += "Agent is still running. Use wait: true or check back later.";
-      } else if (record.status === "error") {
-        output += `Error: ${record.error}${partialOutputSuffix(record)}`;
-      } else {
+      if (record.status === "running" || record.status === "queued") {
+        output += formatAgentOutcome(outcomeForRecord(record));
+      } else if (record.status === "completed") {
         output += record.result?.trim() || "No output.";
+      } else {
+        output += formatAcceptedRecord(record);
       }
 
       // Mark result as consumed — suppresses the completion notification
@@ -1519,7 +1661,7 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
-      return textResult(output);
+      return textResult(output, details);
     },
   }));
 
@@ -1535,20 +1677,20 @@ Terse command-style prompts produce shallow, generic work.
     parameters: Type.Object({
       agent_id: Type.String({
         minLength: 1,
-        description: "Running agent ID returned by Agent.",
+        description: "The agent ID to steer (must be currently running).",
       }),
       message: Type.String({
         minLength: 1,
-        description: "Steering instruction delivered after the current tool execution and stored as a user message.",
+        description: "The steering message to send. This will appear as a user message in the agent's conversation.",
       }),
     }, { additionalProperties: false }),
     execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
       const record = manager.getRecord(params.agent_id);
       if (!record || record.parentAgentId) {
-        throw new Error(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+        rejectInvocation(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
       if (record.status !== "running") {
-        throw new Error(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
+        rejectInvocation(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
       }
       if (!record.session) {
         // Session not ready yet — queue the steer for delivery once initialized
@@ -1573,7 +1715,7 @@ Terse command-style prompts produce shallow, generic work.
           `Current state: ${stateParts.join(" · ")}`,
         );
       } catch (err) {
-        throw new Error(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
+        rejectInvocation(`Failed to steer agent: ${sanitizeAgentCause(err)}`);
       }
     },
   }));
@@ -1601,9 +1743,9 @@ Terse command-style prompts produce shallow, generic work.
     const label = getModelLabelFromConfig(cfg.model);
     if (!registry) return label;
     const resolved = resolveModel(cfg.model, registry);
-    // Configured but unresolvable: runtime fails closed rather than silently
-    // substituting the parent model.
-    if (typeof resolved === "string") return `${label} (unavailable)`;
+    // Configured but unresolvable: the runtime silently falls back to the parent
+    // model, so flag it (and the fallback) rather than hiding the config.
+    if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
     // Surface what it actually resolved to when that differs from the config —
     // e.g. a provider fallback or a looser version pin. Cosmetic separator/date
     // differences are normalized away so an effectively-identical match stays quiet.

@@ -26,7 +26,7 @@ If the target is already known, use a direct tool — `read` for a known path, `
 - Use a nonblank model to override the selected agent's frontmatter model (as "provider/modelId", or an unambiguous fuzzy name). Blank means omitted.
 - Agent frontmatter takes precedence for thinking, max_turns, run_in_background, inherit_context, and isolated; call values fill only fields frontmatter leaves unspecified.
 - With resume, only prompt and resume are used. Omit spawn-only fields; use steer_subagent to redirect a running agent.
-- Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications), or isolation: "off" to explicitly disable worktree isolation even when the chosen agent defaults to it. The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.{{scheduleGuideline}}
+- Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications), or isolation: "off" to explicitly disable an agent default. The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.{{scheduleGuideline}}
 
 ## Writing the prompt
 

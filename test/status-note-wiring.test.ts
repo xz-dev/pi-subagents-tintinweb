@@ -4,7 +4,9 @@
  * a string. Drives the registered `Agent` / `get_subagent_result` tools and
  * inspects the text delivered back, for a turn-limit abort and a user stop.
  */
+import { type AgentSession, initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentRecord } from "../src/types.js";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -59,6 +61,251 @@ function ctx() {
 
 const textOf = (r: any): string => r.content[0].text;
 
+function modelCtx() {
+  const context = ctx();
+  context.model = {
+    provider: "openai-codex",
+    id: "gpt-5.6-sol",
+    name: "GPT-5.6 Sol",
+  };
+  return context;
+}
+
+function runtimeSession(provider = "openai-codex", id = "gpt-5.6-sol", thinkingLevel = "xhigh") {
+  return {
+    model: { provider, id, name: "Ambiguous Display Name" },
+    thinkingLevel,
+    dispose: vi.fn(),
+  } as never;
+}
+
+describe("Agent tool model display", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("shows the canonical runtime model with its effective thinking in collapsed and expanded results", async () => {
+    const session = runtimeSession();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      options.onSessionCreated?.(session);
+      return { responseText: "done", session, aborted: false, steered: false };
+    });
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    const tool = tools.get("Agent");
+    const onUpdate = vi.fn();
+
+    const result = await tool.execute(
+      "tc-model",
+      { prompt: "go", description: "d", subagent_type: "general-purpose", thinking: "max" },
+      undefined,
+      onUpdate,
+      modelCtx(),
+    );
+
+    for (const candidate of [onUpdate.mock.calls.at(-1)?.[0], result]) {
+      const collapsed = tool.renderResult(candidate, { expanded: false, isPartial: false }, {
+        fg: (_color: string, text: string) => text,
+      }, { isError: false }).render(120).join("\n");
+      const expanded = tool.renderResult(candidate, { expanded: true, isPartial: false }, {
+        fg: (_color: string, text: string) => text,
+      }, { isError: false }).render(120).join("\n");
+      expect(collapsed).toContain("openai-codex/gpt-5.6-sol");
+      expect(expanded).toContain("openai-codex/gpt-5.6-sol");
+      expect(collapsed).toContain("thinking:");
+      expect(expanded).toContain("thinking:");
+      expect(collapsed).not.toContain("Ambiguous Display Name");
+    }
+    expect(result.details.tags).toContain("thinking: xhigh");
+  });
+
+  it("shows the canonical pre-session model in the immediate background result", async () => {
+    let releaseSession: (() => void) | undefined;
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      await new Promise<void>(resolve => { releaseSession = resolve; });
+      const session = runtimeSession("anthropic", "claude-sonnet-4-6", "high");
+      options.onSessionCreated?.(session);
+      return { responseText: "done", session, aborted: false, steered: false };
+    });
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    const tool = tools.get("Agent");
+    const result = await tool.execute(
+      "tc-background-model",
+      {
+        prompt: "go",
+        description: "d",
+        subagent_type: "general-purpose",
+        run_in_background: true,
+        thinking: "max",
+      },
+      undefined,
+      undefined,
+      modelCtx(),
+    );
+
+    for (const expanded of [false, true]) {
+      const rendered = tool.renderResult(result, { expanded, isPartial: false }, {
+        fg: (_color: string, text: string) => text,
+      }, { isError: false }).render(120).join("\n");
+      expect(rendered).toContain("openai-codex/gpt-5.6-sol");
+      expect(rendered).toContain("thinking:");
+      expect(rendered).not.toContain("anthropic/claude-sonnet-4-6");
+    }
+    releaseSession?.();
+    await new Promise(resolve => setTimeout(resolve, 0));
+  });
+
+  it("uses the existing session metadata when resuming", async () => {
+    const session = runtimeSession("anthropic", "claude-opus-4-6", "high");
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      options.onSessionCreated?.(session);
+      return { responseText: "first", session, aborted: false, steered: false };
+    });
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    const tool = tools.get("Agent");
+    const first = await tool.execute(
+      "tc-resume-first",
+      { prompt: "go", description: "original", subagent_type: "general-purpose", run_in_background: true },
+      undefined,
+      undefined,
+      modelCtx(),
+    );
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const agentId = first.details.agentId;
+    const conflictingCtx = modelCtx();
+    conflictingCtx.model = { provider: "google", id: "gemini-3-pro", name: "Gemini" };
+
+    session.model = { provider: "anthropic", id: "claude-sonnet-4-6", name: "Switched" };
+    session.thinkingLevel = "medium";
+    const resumed = await tool.execute(
+      "tc-resume-second",
+      {
+        prompt: "continue",
+        description: "changed",
+        subagent_type: "Explore",
+        model: "google/gemini-3-pro",
+        thinking: "minimal",
+        resume: agentId,
+      },
+      undefined,
+      undefined,
+      conflictingCtx,
+    );
+    const rendered = tool.renderResult(resumed, { expanded: false, isPartial: false }, {
+      fg: (_color: string, text: string) => text,
+    }, { isError: false }).render(120).join("\n");
+    expect(rendered).toContain("anthropic/claude-sonnet-4-6");
+    expect(rendered).toContain("thinking: medium");
+    expect(rendered).not.toContain("google/gemini-3-pro");
+  });
+});
+
+describe("get_subagent_result rendering", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("collapses completed reports and expands the unchanged full payload", async () => {
+    initTheme("dark");
+    const payload = "first report line\nsecond report line\nthird report line";
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: payload,
+      session: { dispose: vi.fn() } as any,
+      aborted: false,
+      steered: false,
+    });
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+
+    const spawn = await tools.get("Agent").execute(
+      "tc-result-render",
+      { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: true },
+      undefined, undefined, ctx(),
+    );
+    const id = textOf(spawn).match(/Agent ID: (\S+)/)?.[1];
+    expect(id, "background spawn should surface an agent id").toBeTruthy();
+
+    const result = await tools.get("get_subagent_result").execute(
+      "tc-result-read", { agent_id: id, wait: true }, undefined, undefined, ctx(),
+    );
+    expect(textOf(result)).toContain("Status: completed");
+    expect(textOf(result)).toContain(payload);
+
+    const renderer = tools.get("get_subagent_result").renderResult;
+    const theme = { fg: (_color: string, text: string) => text };
+    const collapsed = renderer(result, { expanded: false, isPartial: false }, theme).render(120).join("\n");
+    const expanded = renderer(result, { expanded: true, isPartial: false }, theme).render(120).join("\n");
+
+    expect(collapsed).not.toContain("second report line");
+    expect(collapsed).toContain("to expand");
+    for (const line of textOf(result).split("\n")) {
+      expect(expanded).toContain(line);
+    }
+  });
+
+  const rendererCases: Record<AgentRecord["status"], { collapses: boolean }> = {
+    queued: { collapses: false },
+    running: { collapses: false },
+    completed: { collapses: true },
+    steered: { collapses: true },
+    aborted: { collapses: true },
+    stopped: { collapses: true },
+    error: { collapses: false },
+  };
+  it.each(Object.entries(rendererCases))("renders %s status according to its classification", (status, { collapses }) => {
+    initTheme("dark");
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    const renderer = tools.get("get_subagent_result").renderResult;
+    const payload = "first report line\nsecond report line\nthird report line";
+    const theme = { fg: (_color: string, text: string) => text };
+    const rendered = renderer(
+      { content: [{ type: "text", text: payload }], details: { status } },
+      { expanded: false, isPartial: false },
+      theme,
+    ).render(120).join("\n");
+
+    for (const line of payload.split("\n")) {
+      if (collapses) {
+        expect(rendered).not.toContain(line);
+      } else {
+        expect(rendered).toContain(line);
+      }
+    }
+    if (collapses) {
+      expect(rendered).toContain("to expand");
+    } else {
+      expect(rendered).not.toContain("to expand");
+    }
+  });
+
+  const visibleOverrides: Array<{
+    name: string;
+    details: { status: AgentRecord["status"] } | undefined;
+    options?: { expanded?: boolean; isPartial?: boolean };
+  }> = [
+    { name: "missing details", details: undefined },
+    { name: "partial render", details: { status: "completed" }, options: { isPartial: true } },
+    { name: "expanded render", details: { status: "completed" }, options: { expanded: true } },
+  ];
+  it.each(visibleOverrides)("keeps every payload line visible for $name", ({ details, options }) => {
+    initTheme("dark");
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    const renderer = tools.get("get_subagent_result").renderResult;
+    const payload = "first report line\nsecond report line\nthird report line";
+    const theme = { fg: (_color: string, text: string) => text };
+    const rendered = renderer(
+      { content: [{ type: "text", text: payload }], details },
+      { expanded: false, isPartial: false, ...options },
+      theme,
+    ).render(120).join("\n");
+
+    for (const line of payload.split("\n")) {
+      expect(rendered).toContain(line);
+    }
+    expect(rendered).not.toContain("to expand");
+  });
+});
+
 describe("status note reaches the parent through the real handlers", () => {
   afterEach(() => {
     delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
@@ -82,25 +329,15 @@ describe("status note reaches the parent through the real handlers", () => {
     );
 
     const out = textOf(res);
-    // Exact lead clause, not just "turn limit": a steered/aborted mix-up would
-    // otherwise slip through, and they are different outcomes.
-    expect(out).toContain("aborted at the turn limit");
-    expect(out).toContain("partial work so far");     // partial result still delivered
-    expect(out).not.toContain("STOPPED BY THE USER"); // not mislabelled as a user stop
-
-    // The two answers a foreground parent needs: is this all of it, and is the
-    // task done. The first is what #174 turned on — the parent has no agent id,
-    // so it must not read "partial" as "go fetch the rest".
-    expect(out).toContain("everything the agent produced is above");
-    expect(out).toContain("the task is unfinished");
-    // State only, never an instruction to act (see getForegroundOutcomeNote):
-    // advising a fresh run to save one wasted tool call is a bet nothing here
-    // can measure. And naming the tool we steer away from only raises its salience.
-    expect(out).not.toContain("re-spawn");
-    expect(out).not.toContain("get_subagent_result");
+    expect(out).toContain("status: aborted");
+    expect(out).toContain("category: max_turns");
+    expect(out).toContain("recovery: resume_same_agent");
+    expect(out).toContain("fresh_spawn: forbidden");
+    expect(out).toContain("agent_id:");
+    expect(out).toContain("partial work so far");
   });
 
-  it("foreground user-stop → tells the parent NOT to restart it unasked", async () => {
+  it("foreground user-stop → tells the parent to resume the accepted same agent", async () => {
     // Pi delivers a user ESC as an abort on the tool's signal; the manager wires
     // that to abort(id) (#44), landing the record on "stopped" — deliberately
     // distinct from a turn-limit "aborted", because the correct next action is
@@ -118,26 +355,48 @@ describe("status note reaches the parent through the real handlers", () => {
       parent.signal, undefined, ctx(),
     );
 
-    // The manager only wires addEventListener("abort", …) and never checks
-    // signal.aborted upfront (agent-manager.ts:240-243), so aborting before the
-    // listener is attached would silently land on "completed" instead. Flush
-    // first rather than relying on spawn() happening in execute()'s synchronous
-    // prefix, which any future await in that path would quietly break.
     await new Promise((r) => setImmediate(r));
     parent.abort(); // the user hits ESC
     finish({ responseText: "partial work so far", session: { dispose: vi.fn() }, aborted: false, steered: false });
 
     const out = textOf(await call);
-    expect(out).toContain("STOPPED BY THE USER");
-    expect(out).toContain("everything the agent produced is above");
-    // Same claim, same confidence, same words as the aborted case — only the
-    // lead clause distinguishes them.
-    expect(out).toContain("the task is unfinished");
-    // State only, here most of all. Advice to re-spawn would re-run work a human
-    // deliberately killed; advice to ask first presumes someone is there to ask,
-    // which is false under `pi -p`, scheduled jobs, and background-driven runs.
-    expect(out).not.toContain("re-spawn");
-    expect(out).not.toContain("ask before");
+    expect(out).toContain("status: stopped");
+    expect(out).toContain("category: caller_stop");
+    expect(out).toContain("recovery: resume_same_agent");
+    expect(out).toContain("fresh_spawn: forbidden");
+    expect(out).toContain("partial work so far");
+  });
+
+  it("foreground pre-aborted caller signal keeps same-agent recovery once its session exists", async () => {
+    let childWasAbortedAtInvocation: boolean | undefined;
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options) => {
+      childWasAbortedAtInvocation = options.signal?.aborted;
+      return Promise.resolve({
+        responseText: "partial work so far",
+        session: { dispose: vi.fn() } as unknown as AgentSession,
+        aborted: false,
+        steered: false,
+      });
+    });
+    const { pi, tools } = makePi();
+    subagentsExtension(pi);
+    const parent = new AbortController();
+    parent.abort();
+
+    const res = await tools.get("Agent").execute(
+      "tc-pre-aborted",
+      { prompt: "go", description: "d", subagent_type: "general-purpose" },
+      parent.signal,
+      undefined,
+      ctx(),
+    );
+
+    const out = textOf(res);
+    expect(childWasAbortedAtInvocation).toBe(true);
+    expect(out).toContain("status: stopped");
+    expect(out).toContain("category: caller_stop");
+    expect(out).toContain("recovery: resume_same_agent");
+    expect(out).toContain("fresh_spawn: forbidden");
   });
 
   it("hides nested records from top-level tools, registry, transcripts, and lifecycle", async () => {
@@ -181,21 +440,16 @@ describe("status note reaches the parent through the real handlers", () => {
     await new Promise(resolve => setTimeout(resolve, 0));
 
     expect(registry.getRecord(id)).toBeUndefined();
+    // Nested IDs stay hidden from top-level tools; #180 surfaces missing/hidden
+    // agents as Pi tool errors (throws) rather than soft text results.
     for (const [name, params] of [
       ["get_subagent_result", { agent_id: id }],
       ["steer_subagent", { agent_id: id, message: "stop" }],
+      ["Agent", { resume: id, prompt: "continue", description: "resume", subagent_type: "general-purpose" }],
     ] as const) {
-      await expect(
-        tools.get(name).execute("tc-nested", params, undefined, undefined, ctx()),
-      ).rejects.toThrow("Agent not found");
+      await expect(tools.get(name).execute("tc-nested", params, undefined, undefined, ctx()))
+        .rejects.toThrow(/Agent not found/);
     }
-    await expect(tools.get("Agent").execute(
-      "tc-nested",
-      { resume: id, prompt: "continue", description: "resume", subagent_type: "general-purpose" },
-      undefined,
-      undefined,
-      ctx(),
-    )).rejects.toThrow("Agent not found");
     expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:started", expect.objectContaining({ id }));
     expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:completed", expect.objectContaining({ id }));
     expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:failed", expect.objectContaining({ id }));
